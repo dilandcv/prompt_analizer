@@ -2,3 +2,5 @@ flask
 tiktoken
 deep-translator
 ollama
+openpyxl
+PyMuPDF
