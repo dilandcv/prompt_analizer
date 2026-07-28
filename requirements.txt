@@ -1,0 +1,4 @@
+flask
+tiktoken
+deep-translator
+ollama
