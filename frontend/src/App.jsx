@@ -1,6 +1,6 @@
 import { useState } from "react";
 
-const API = "http://localhost:8000";
+const API = "";
 
 function Header() {
   return (
@@ -74,6 +74,9 @@ function PromptTab({ onResult }) {
 }
 
 function ResultsSection({ data }) {
+  if (data?.error) {
+    return <div className="error-card"><span className="error-icon">!</span><p>{data.error}</p></div>;
+  }
   const { original, idioma, tokens_orig, tokens_trad, traduccion, prompt, optimo, mejora, modelo } = data;
 
   return (

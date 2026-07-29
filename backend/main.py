@@ -1,4 +1,6 @@
 """Token Analyzer — FastAPI Backend."""
+import sys, time as _time
+
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -10,6 +12,7 @@ from backend.token_counter import (
     contar_tokens, traducir, detectar_idioma,
     analizar_prompt, generar_ejemplo_mejora, recomendar_modelo,
     leer_excel_resenas, leer_csv_resenas, extraer_texto_archivo,
+    leer_carpeta_excel,
     clasificar_resenas_qwen, calcular_costo, contar_tokens_texto,
     _RESENAS_POR_DIA, _DIAS_POR_MES,
 )
@@ -26,18 +29,31 @@ async def analyze_prompt(texto: str = Form("")):
         raise HTTPException(400, "Texto vacío")
 
     idioma = detectar_idioma(texto)
-    if idioma == "es":
+    try:
+        if idioma == "es":
+            tokens_orig = contar_tokens(texto)
+            traduccion = traducir(texto, "es", "en")
+            tokens_trad = contar_tokens(traduccion)
+        else:
+            traduccion = traducir(texto, "en", "es")
+            tokens_orig = contar_tokens(texto)
+            tokens_trad = contar_tokens(traduccion)
+    except Exception:
+        traduccion = ""
         tokens_orig = contar_tokens(texto)
-        traduccion = traducir(texto, "es", "en")
-        tokens_trad = contar_tokens(traduccion)
-    else:
-        traduccion = traducir(texto, "en", "es")
-        tokens_orig = contar_tokens(texto)
-        tokens_trad = contar_tokens(traduccion)
+        tokens_trad = 0
 
-    prompt = analizar_prompt(texto)
+    try:
+        prompt = analizar_prompt(texto)
+    except Exception:
+        prompt = {"puntaje": 0, "nivel": "error", "detalles": [],
+                  "fortalezas": [], "debilidades": [], "recomendaciones": [],
+                  "puntaje_ia": 0, "puntaje_heuristico": 0, "evaluacion_ia": False}
     optimo = prompt["puntaje"] >= 80
-    mejora = None if optimo else generar_ejemplo_mejora(texto)
+    try:
+        mejora = None if optimo else generar_ejemplo_mejora(texto)
+    except Exception:
+        mejora = None
     modelo = recomendar_modelo(texto, prompt)
 
     return {
@@ -54,6 +70,57 @@ async def analyze_prompt(texto: str = Form("")):
 
 
 # ── Excel / File Reviews ──
+
+def _procesar_resenas(todas_resenas: list, optimizar: bool) -> list:
+    resultados = []
+    for texto in todas_resenas:
+        tokens_es = contar_tokens_texto(texto)
+        tokens_en = tokens_es
+        traduccion = ""
+        if optimizar:
+            try:
+                traduccion = traducir(texto, "es", "en")
+                tokens_en = contar_tokens_texto(traduccion)
+            except Exception:
+                tokens_en = tokens_es
+        resultados.append({
+            "original": texto, "traduccion": traduccion,
+            "tokens_es": tokens_es, "tokens_en": tokens_en,
+        })
+    return resultados
+
+
+def _calcular_stats(resultados: list, total_es: int, total_en: int) -> dict:
+    n = len(resultados)
+    costo_diario_es = calcular_costo(total_es * _RESENAS_POR_DIA / n) if n else 0
+    costo_diario_en = calcular_costo(total_en * _RESENAS_POR_DIA / n) if n else 0
+    costo_mensual_es = round(costo_diario_es * _DIAS_POR_MES, 2)
+    costo_mensual_en = round(costo_diario_en * _DIAS_POR_MES, 2)
+    costo_anual_es = round(costo_mensual_es * 12, 2)
+    costo_anual_en = round(costo_mensual_en * 12, 2)
+    ahorro_diario = round(costo_diario_es - costo_diario_en, 2)
+    ahorro_mensual = round(costo_mensual_es - costo_mensual_en, 2)
+    ahorro_anual = round(costo_anual_es - costo_anual_en, 2)
+    pct_ahorro = round(ahorro_mensual / costo_mensual_es * 100, 1) if costo_mensual_es > 0 else 0
+    return {
+        "total_resenas": n,
+        "total_tokens_es": total_es,
+        "total_tokens_en": total_en,
+        "promedio_es": round(total_es / n) if n else 0,
+        "promedio_en": round(total_en / n) if n else 0,
+        "ahorro_diario": ahorro_diario,
+        "ahorro_mensual": ahorro_mensual,
+        "ahorro_anual": ahorro_anual,
+        "costo_diario_es": costo_diario_es,
+        "costo_diario_en": costo_diario_en,
+        "costo_mensual_es": costo_mensual_es,
+        "costo_mensual_en": costo_mensual_en,
+        "costo_anual_es": costo_anual_es,
+        "costo_anual_en": costo_anual_en,
+        "ahorro": ahorro_mensual,
+        "pct_ahorro": pct_ahorro,
+    }
+
 
 @app.post("/api/reviews")
 async def process_reviews(
@@ -98,51 +165,65 @@ async def process_reviews(
     if not todas_resenas:
         raise HTTPException(400, "No se encontraron reseñas en los archivos.")
 
-    resultados = []
-    total_es = total_en = 0
-    for texto in todas_resenas:
-        tokens_es = contar_tokens_texto(texto)
-        tokens_en = tokens_es
-        traduccion = ""
-        if optimizar:
-            try:
-                traduccion = traducir(texto, "es", "en")
-                tokens_en = contar_tokens_texto(traduccion)
-            except Exception:
-                tokens_en = tokens_es
-        total_es += tokens_es
-        total_en += tokens_en
-        resultados.append({
-            "original": texto, "traduccion": traduccion,
-            "tokens_es": tokens_es, "tokens_en": tokens_en,
-        })
+    resultados = _procesar_resenas(todas_resenas, optimizar)
+    total_es = sum(r["tokens_es"] for r in resultados)
+    total_en = sum(r["tokens_en"] for r in resultados)
 
-    clasificaciones = clasificar_resenas_qwen(todas_resenas)
+    textos_para_clasificar = [r["traduccion"] if (optimizar and r["traduccion"]) else r["original"] for r in resultados]
+    clasificaciones = clasificar_resenas_qwen(textos_para_clasificar)
     for i, r in enumerate(resultados):
         if i < len(clasificaciones):
             r["clasificacion"] = clasificaciones[i]
         r["costo"] = calcular_costo(r["tokens_en"] if optimizar else r["tokens_es"])
 
-    n = len(resultados)
-    costo_mensual_es = calcular_costo(total_es * _RESENAS_POR_DIA * _DIAS_POR_MES / n) if n else 0
-    costo_mensual_en = calcular_costo(total_en * _RESENAS_POR_DIA * _DIAS_POR_MES / n) if n else 0
-    ahorro = round(costo_mensual_es - costo_mensual_en, 2)
-    pct_ahorro = round(ahorro / costo_mensual_es * 100, 1) if costo_mensual_es > 0 else 0
+    stats = _calcular_stats(resultados, total_es, total_en)
 
     return {
         "resultados": resultados,
-        "stats": {
-            "total_resenas": n,
-            "total_tokens_es": total_es,
-            "total_tokens_en": total_en,
-            "promedio_es": round(total_es / n) if n else 0,
-            "promedio_en": round(total_en / n) if n else 0,
-            "costo_mensual_es": costo_mensual_es,
-            "costo_mensual_en": costo_mensual_en,
-            "ahorro": ahorro,
-            "pct_ahorro": pct_ahorro,
-        },
+        "stats": stats,
         "columnas_disponibles": sorted(columnas_globales),
+        "optimizar": optimizar,
+    }
+
+
+# ── Folder Ingest ──
+
+@app.post("/api/reviews/folder")
+async def process_reviews_folder(
+    carpeta: str = Form(...),
+    columna: str = Form(""),
+    optimizar: bool = Form(False),
+):
+    if not carpeta.strip():
+        raise HTTPException(400, "Debe especificar una ruta de carpeta.")
+
+    try:
+        todas_resenas, columnas_globales = leer_carpeta_excel(carpeta.strip(), columna or None)
+    except FileNotFoundError as e:
+        raise HTTPException(400, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+    if not todas_resenas:
+        raise HTTPException(400, "No se encontraron reseñas en la carpeta.")
+
+    resultados = _procesar_resenas(todas_resenas, optimizar)
+    total_es = sum(r["tokens_es"] for r in resultados)
+    total_en = sum(r["tokens_en"] for r in resultados)
+
+    textos_para_clasificar = [r["traduccion"] if (optimizar and r["traduccion"]) else r["original"] for r in resultados]
+    clasificaciones = clasificar_resenas_qwen(textos_para_clasificar)
+    for i, r in enumerate(resultados):
+        if i < len(clasificaciones):
+            r["clasificacion"] = clasificaciones[i]
+        r["costo"] = calcular_costo(r["tokens_en"] if optimizar else r["tokens_es"])
+
+    stats = _calcular_stats(resultados, total_es, total_en)
+
+    return {
+        "resultados": resultados,
+        "stats": stats,
+        "columnas_disponibles": columnas_globales,
         "optimizar": optimizar,
     }
 

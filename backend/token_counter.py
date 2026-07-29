@@ -8,18 +8,20 @@ try:
     import ollama
     OLLAMA_EVAL_MODEL = "qwen2.5:0.5b"
     OLLAMA_MEJORA_MODEL = "qwen2.5:0.5b"
+    _ollama_client = ollama.Client(timeout=15)
     _ollama_disponible = True
 except ImportError:
     ollama = None
     OLLAMA_EVAL_MODEL = "qwen2.5:0.5b"
     OLLAMA_MEJORA_MODEL = "qwen2.5:0.5b"
+    _ollama_client = None
     _ollama_disponible = False
 
 
 
 def _ollama_generate(prompt: str, model: str = None, max_tokens: int = 500,
                      temperature: float = 0.1) -> str:
-    response = ollama.generate(
+    response = _ollama_client.generate(
         model=model or OLLAMA_MEJORA_MODEL,
         prompt=prompt,
         options={"temperature": temperature, "num_predict": max_tokens},
@@ -238,8 +240,17 @@ def contar_tokens(texto: str) -> int:
 
 
 def traducir(texto: str, origen: str, destino: str) -> str:
-    traductor = GoogleTranslator(source=origen, target=destino)
-    return traductor.translate(texto)
+    try:
+        traductor = GoogleTranslator(source=origen, target=destino)
+        return traductor.translate(texto)
+    except Exception:
+        if _ollama_client is None:
+            raise
+        prompt = (
+            f"Translate the following text from {origen.upper()} to {destino.upper()}. "
+            f"Respond ONLY with the translation, no explanations:\n\n{texto}"
+        )
+        return _ollama_generate(prompt, max_tokens=1000, temperature=0.1)
 
 
 def traducir_a_ingles(texto: str) -> str:
@@ -265,14 +276,13 @@ def analizar_prompt(texto: str) -> dict:
     if len(texto_limpio) < 10:
         return _evaluacion_heuristica_completa(texto)
 
-    global _ollama_disponible
-    if _ollama_disponible:
+    if _ollama_client is not None:
         try:
             eval_qwen = _evaluar_con_qwen(texto)
             if eval_qwen and isinstance(eval_qwen.get("score"), (int, float)):
                 return _formatear_evaluacion_qwen(eval_qwen)
         except Exception:
-            _ollama_disponible = False
+            pass
 
     return _evaluacion_heuristica_completa(texto)
 
@@ -445,8 +455,7 @@ def generar_ejemplo_mejora(texto: str) -> dict:
     mejor_eval = None
     intentos_mejora = 0
 
-    global _ollama_disponible
-    if _ollama_disponible:
+    if _ollama_client is not None:
         for intento in range(2):
             evaluacion = analizar_prompt(mejor_mejora)
             score = evaluacion.get("puntaje", 0)
@@ -486,8 +495,7 @@ def generar_ejemplo_mejora(texto: str) -> dict:
 
 def _construir_mejora(texto: str) -> str:
     """Genera un prompt mejorado con Qwen, apuntando a la rubrica de evaluacion."""
-    global _ollama_disponible
-    if _ollama_disponible:
+    if _ollama_client is not None:
         try:
             prompt_ia = (
                 "Eres un experto en Prompt Engineering. Tu tarea es mejorar el "
@@ -516,7 +524,7 @@ def _construir_mejora(texto: str) -> str:
             if mejora and len(mejora) > 20:
                 return mejora
         except Exception:
-            _ollama_disponible = False
+            pass
 
     tiene_pregunta = bool(re.search(r"¿?\?$", texto.strip()))
     tiene_verbo = bool(re.search(
@@ -541,8 +549,7 @@ def _construir_mejora(texto: str) -> str:
 
 def _construir_mejora_con_feedback(texto_actual: str, evaluacion: dict) -> str:
     """Reintento de mejora usando las debilidades detectadas en la evaluacion."""
-    global _ollama_disponible
-    if not _ollama_disponible:
+    if _ollama_client is None:
         return ""
 
     try:
@@ -577,6 +584,7 @@ def _construir_mejora_con_feedback(texto_actual: str, evaluacion: dict) -> str:
 
 import io
 import json as _json
+from pathlib import Path
 
 _PRECIO_POR_MILLON = 2.50
 _RESENAS_POR_DIA = 10000
@@ -606,7 +614,9 @@ def leer_excel_resenas(filepath: str, columna: str = None) -> tuple:
     headers = [str(h).strip() if h else "" for h in rows[0]]
     if not columna:
         columna = _detectar_columna_review(headers)
-    col_idx = headers.index(columna) if columna in headers else 0
+    if columna not in headers:
+        raise ValueError(f"Columna '{columna}' no encontrada. Columnas disponibles: {headers}")
+    col_idx = headers.index(columna)
 
     resenas = []
     for row in rows[1:]:
@@ -640,6 +650,8 @@ def leer_csv_resenas(filepath: str, columna: str = None) -> tuple:
         fieldnames = list(reader.fieldnames or [])
         if not columna:
             columna = _detectar_columna_review(fieldnames)
+        if columna not in fieldnames:
+            raise ValueError(f"Columna '{columna}' no encontrada. Columnas disponibles: {fieldnames}")
         resenas = []
         for row in reader:
             val = row.get(columna, "").strip()
@@ -690,7 +702,7 @@ def clasificar_resenas_qwen(resenas: list, chunk_size: int = 30) -> list:
     Retorna una lista de dicts con error_type, component, severity,
     summary y category para cada reseña.
     """
-    if not _ollama_disponible:
+    if _ollama_client is None:
         return [_clasificacion_fallback(r) for r in resenas]
 
     resultados = []
@@ -773,3 +785,60 @@ def _clasificacion_fallback(texto: str) -> dict:
         "error_type": err, "component": comp, "severity": sev,
         "summary": texto[:120], "category": "bug" if err != "performance" else "performance",
     }
+
+
+def leer_carpeta_excel(ruta_carpeta: str, columna: str = None) -> tuple:
+    """Lee una carpeta con archivos .xlsx y consolida todas las reseñas.
+
+    Args:
+        ruta_carpeta: ruta al directorio que contiene los .xlsx.
+        columna: nombre de columna a usar. Si es None, se auto-detecta.
+
+    Returns:
+        (resenas, columnas_disponibles) donde resenas es list[str] y
+        columnas_disponibles es list[str] con headers de todos los archivos.
+    """
+    carpeta = Path(ruta_carpeta)
+    if not carpeta.is_dir():
+        raise FileNotFoundError(f"La carpeta no existe: {ruta_carpeta}")
+
+    archivos_xlsx = sorted(carpeta.glob("*.xlsx"))
+    if not archivos_xlsx:
+        raise ValueError(f"No se encontraron archivos .xlsx en: {ruta_carpeta}")
+
+    try:
+        import pandas as pd
+    except ImportError:
+        pandas = None
+
+    todas_resenas = []
+    columnas_globales = set()
+
+    for archivo in archivos_xlsx:
+        try:
+            if pandas is not None:
+                df = pd.read_excel(archivo, dtype=str)
+                headers = list(df.columns)
+                columnas_globales.update(headers)
+
+                col = columna if columna else _detectar_columna_review(headers)
+                if col not in headers:
+                    col = headers[0] if headers else ""
+
+                if col in df.columns:
+                    valores = df[col].dropna().astype(str).str.strip()
+                    resenas_archivo = [v for v in valores if len(v) > 3]
+                else:
+                    resenas_archivo = []
+            else:
+                resenas_archivo, headers = leer_excel_resenas(str(archivo), columna)
+                columnas_globales.update(headers)
+
+            todas_resenas.extend(resenas_archivo)
+        except Exception as e:
+            raise ValueError(f"Error al leer {archivo.name}: {e}")
+
+    if not todas_resenas:
+        raise ValueError("No se encontraron reseñas en los archivos.")
+
+    return todas_resenas, sorted(columnas_globales)
