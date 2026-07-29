@@ -8,7 +8,7 @@ try:
     import ollama
     OLLAMA_EVAL_MODEL = "qwen2.5:0.5b"
     OLLAMA_MEJORA_MODEL = "qwen2.5:0.5b"
-    _ollama_client = ollama.Client(timeout=15)
+    _ollama_client = ollama.Client(timeout=10)
     _ollama_disponible = True
 except ImportError:
     ollama = None
@@ -104,7 +104,7 @@ def _evaluar_con_qwen(texto: str) -> dict:
     respuesta = _ollama_generate(
         prompt_ia,
         model=OLLAMA_EVAL_MODEL,
-        max_tokens=700,
+        max_tokens=200,
         temperature=0.1,
     )
     return _parsear_json_qwen(respuesta)
@@ -250,7 +250,7 @@ def traducir(texto: str, origen: str, destino: str) -> str:
             f"Translate the following text from {origen.upper()} to {destino.upper()}. "
             f"Respond ONLY with the translation, no explanations:\n\n{texto}"
         )
-        return _ollama_generate(prompt, max_tokens=1000, temperature=0.1)
+        return _ollama_generate(prompt, max_tokens=200, temperature=0.1)
 
 
 def traducir_a_ingles(texto: str) -> str:
@@ -441,39 +441,13 @@ def recomendar_modelo(texto: str, prompt_info: dict) -> dict:
 
 
 def generar_ejemplo_mejora(texto: str) -> dict:
-    """Genera un prompt mejorado y revalida hasta 2 veces si el score < 80.
+    """Genera un prompt mejorado con Qwen y lo traduce a ingles."""
 
-    Flujo:
-    1. Genera mejora inicial con Qwen.
-    2. Evalua la mejora con el mismo sistema (Qwen).
-    3. Si score < 80, reintenta usando las debilidades detectadas.
-    4. Si tras 2 intentos sigue < 80, retorna el mejor resultado.
-    5. Nunca entra en ciclo infinito (maximo 3 evaluaciones totales).
-    """
     mejora_es = _construir_mejora(texto)
-    mejor_mejora = mejora_es
-    mejor_eval = None
-    intentos_mejora = 0
 
-    if _ollama_client is not None:
-        for intento in range(2):
-            evaluacion = analizar_prompt(mejor_mejora)
-            score = evaluacion.get("puntaje", 0)
-            if mejor_eval is None or score > mejor_eval.get("puntaje", 0):
-                mejor_eval = evaluacion
+    mejora_en = traducir_a_ingles(mejora_es)
 
-            if score >= 80:
-                break
-
-            if intento < 1:
-                nueva = _construir_mejora_con_feedback(mejor_mejora, evaluacion)
-                if nueva and len(nueva) > 20:
-                    mejor_mejora = nueva
-                    intentos_mejora += 1
-
-    mejora_en = traducir_a_ingles(mejor_mejora)
-
-    tokens_es = contar_tokens(mejor_mejora)
+    tokens_es = contar_tokens(mejora_es)
     tokens_en = contar_tokens(mejora_en)
 
     if tokens_es <= tokens_en:
@@ -484,7 +458,7 @@ def generar_ejemplo_mejora(texto: str) -> dict:
         ahorro = tokens_es - tokens_en
 
     return {
-        "mejora_es": mejor_mejora,
+        "mejora_es": mejora_es,
         "mejora_en": mejora_en,
         "tokens_es": tokens_es,
         "tokens_en": tokens_en,
@@ -518,7 +492,7 @@ def _construir_mejora(texto: str) -> str:
             mejora = _ollama_generate(
                 prompt_ia,
                 model=OLLAMA_MEJORA_MODEL,
-                max_tokens=500,
+                max_tokens=150,
                 temperature=0.2,
             )
             if mejora and len(mejora) > 20:
