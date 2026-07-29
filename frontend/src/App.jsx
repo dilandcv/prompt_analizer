@@ -391,7 +391,10 @@ export default function App() {
         <Tabs active={tab} onTab={(t) => { setTab(t); setResult(null); }} />
 
         {tab === "prompt" && (
-          result ? <ResultsSection data={result} /> : <PromptTab onResult={setResult} />
+          <>
+            <PromptTab onResult={setResult} />
+            {result && <ResultsSection data={result} />}
+          </>
         )}
         {tab === "reviews" && <ReviewsTab />}
       </div>
