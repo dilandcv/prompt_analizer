@@ -14,6 +14,7 @@ from backend.token_counter import (
     leer_excel_resenas, leer_csv_resenas, extraer_texto_archivo,
     leer_carpeta_excel,
     clasificar_resenas_qwen, calcular_costo, contar_tokens_texto,
+    analizar_prompt_rubrica,
     _RESENAS_POR_DIA, _DIAS_POR_MES,
 )
 
@@ -69,15 +70,31 @@ async def analyze_prompt(texto: str = Form("")):
     }
 
 
+# ── Rubric Analysis ──
+
+@app.post("/api/analyze/rubric")
+async def analyze_rubric(texto: str = Form("")):
+    texto = texto.strip()
+    if not texto:
+        raise HTTPException(400, "El prompt no puede estar vacio.")
+    try:
+        result = analizar_prompt_rubrica(texto)
+    except Exception as e:
+        raise HTTPException(500, f"Error auditando el prompt: {str(e)}")
+    if "error" in result:
+        raise HTTPException(400, result["error"])
+    return result
+
+
 # ── Excel / File Reviews ──
 
-def _procesar_resenas(todas_resenas: list, optimizar: bool) -> list:
+def _procesar_resenas(todas_resenas: list, optimizar: bool, rapido: bool = False) -> list:
     resultados = []
     for texto in todas_resenas:
         tokens_es = contar_tokens_texto(texto)
         tokens_en = tokens_es
         traduccion = ""
-        if optimizar:
+        if optimizar and not rapido:
             try:
                 traduccion = traducir(texto, "es", "en")
                 tokens_en = contar_tokens_texto(traduccion)
@@ -127,6 +144,7 @@ async def process_reviews(
     archivos: list[UploadFile] = File(...),
     columna: str = Form(""),
     optimizar: bool = Form(False),
+    rapido: bool = Form(False),
 ):
     todas_resenas = []
     columnas_globales = set()
@@ -165,12 +183,12 @@ async def process_reviews(
     if not todas_resenas:
         raise HTTPException(400, "No se encontraron reseñas en los archivos.")
 
-    resultados = _procesar_resenas(todas_resenas, optimizar)
+    resultados = _procesar_resenas(todas_resenas, optimizar, rapido)
     total_es = sum(r["tokens_es"] for r in resultados)
     total_en = sum(r["tokens_en"] for r in resultados)
 
     textos_para_clasificar = [r["traduccion"] if (optimizar and r["traduccion"]) else r["original"] for r in resultados]
-    clasificaciones = clasificar_resenas_qwen(textos_para_clasificar)
+    clasificaciones = clasificar_resenas_qwen(textos_para_clasificar, rapido=rapido)
     for i, r in enumerate(resultados):
         if i < len(clasificaciones):
             r["clasificacion"] = clasificaciones[i]
@@ -193,6 +211,7 @@ async def process_reviews_folder(
     carpeta: str = Form(...),
     columna: str = Form(""),
     optimizar: bool = Form(False),
+    rapido: bool = Form(False),
 ):
     if not carpeta.strip():
         raise HTTPException(400, "Debe especificar una ruta de carpeta.")
@@ -207,12 +226,12 @@ async def process_reviews_folder(
     if not todas_resenas:
         raise HTTPException(400, "No se encontraron reseñas en la carpeta.")
 
-    resultados = _procesar_resenas(todas_resenas, optimizar)
+    resultados = _procesar_resenas(todas_resenas, optimizar, rapido)
     total_es = sum(r["tokens_es"] for r in resultados)
     total_en = sum(r["tokens_en"] for r in resultados)
 
     textos_para_clasificar = [r["traduccion"] if (optimizar and r["traduccion"]) else r["original"] for r in resultados]
-    clasificaciones = clasificar_resenas_qwen(textos_para_clasificar)
+    clasificaciones = clasificar_resenas_qwen(textos_para_clasificar, rapido=rapido)
     for i, r in enumerate(resultados):
         if i < len(clasificaciones):
             r["clasificacion"] = clasificaciones[i]

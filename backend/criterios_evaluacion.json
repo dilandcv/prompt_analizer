@@ -1,0 +1,52 @@
+{
+  "claridad_y_objetivo": {
+    "peso": 25,
+    "descripcion": "El prompt define con precision que se espera del modelo, sin ambiguedades. La instruccion es directa y el objetivo es evidente.",
+    "niveles": {
+      "excelente": "Instruccion cristalina, objetivo inequivoco, cero ambiguedad",
+      "bueno": "Instruccion clara con objetivo definido, minima ambiguedad",
+      "regular": "Instruccion algo difusa, objetivo parcialmente claro",
+      "deficiente": "Instruccion vaga o confusa, objetivo no definido"
+    }
+  },
+  "concision_y_eficiencia_tokens": {
+    "peso": 25,
+    "descripcion": "El prompt transmite la informacion necesaria sin redundancias, verborrea o tokens desperdiciados. Cada palabra aporta valor.",
+    "niveles": {
+      "excelente": "Cada token cuenta, sin redundancias, longitud optima",
+      "bueno": "Mayormente conciso, alguna redundancia menor",
+      "regular": "Contiene frases redundantes o informacion repetida",
+      "deficiente": "Excesivamente verboso, mucha informacion irrelevante o repetida"
+    }
+  },
+  "contexto_y_restricciones": {
+    "peso": 20,
+    "descripcion": "El prompt proporciona suficiente contexto (rol, audiencia, situacion) y define restricciones claras (tono, exclusiones, limites).",
+    "niveles": {
+      "excelente": "Contexto rico y restricciones explicitas bien definidas",
+      "bueno": "Contexto adecuado, algunas restricciones definidas",
+      "regular": "Contexto minimo o restricciones vagas",
+      "deficiente": "Sin contexto ni restricciones"
+    }
+  },
+  "estructura_y_formato": {
+    "peso": 15,
+    "descripcion": "El prompt solicita un formato de salida especifico (secciones, pasos, lista, JSON, tabla) y tiene estructura interna organizada.",
+    "niveles": {
+      "excelente": "Formato de salida claramente especificado, prompt bien estructurado",
+      "bueno": "Indica formato deseado o tiene estructura aceptable",
+      "regular": "Menciona vagamente el formato o estructura desordenada",
+      "deficiente": "Sin indicacion de formato ni estructura interna"
+    }
+  },
+  "idioma_y_tokenizacion": {
+    "peso": 15,
+    "descripcion": "El prompt esta en un idioma eficiente para la API objetivo. Considera que el ingles consume ~30% menos tokens que el espanol para el mismo contenido.",
+    "niveles": {
+      "excelente": "Prompt en ingles con terminologia precisa",
+      "bueno": "Prompt en ingles con alguna palabra en otro idioma",
+      "regular": "Prompt en espanol u otro idioma de alta tokenizacion",
+      "deficiente": "Prompt multilingue desordenado"
+    }
+  }
+}

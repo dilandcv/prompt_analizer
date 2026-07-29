@@ -81,7 +81,6 @@ function ResultsSection({ data }) {
 
   return (
     <div className="fade-in">
-      {/* Original / Translation */}
       <div className="section-title"><h3>RESULTADOS</h3><div className="section-div" /></div>
       <div className="compare-grid">
         <div className="card">
@@ -90,36 +89,40 @@ function ResultsSection({ data }) {
             <h3>ORIGINAL</h3>
           </div>
           <p className="card-text">{original}</p>
+          <div className="card-tokens">
+            <span>{tokens_orig} tokens</span>
+            <span>·</span>
+            <span>{original?.split(" ").length} palabras</span>
+          </div>
         </div>
         <div className="card">
           <div className="card-header">
             <span className={`badge ${idioma === "es" ? "en" : "es"}`}>{idioma === "es" ? "EN" : "ES"}</span>
             <h3>TRADUCCIÓN</h3>
           </div>
-          <p className="card-text">{traduccion}</p>
+          <p className="card-text">{traduccion || "—"}</p>
+          <div className="card-tokens">
+            <span>{tokens_trad} tokens</span>
+            <span>·</span>
+            <span>{traduccion?.split(" ").filter(Boolean).length} palabras</span>
+          </div>
         </div>
       </div>
+
+      {mejora && (
+        <div className="stats-grid" style={{ marginBottom: "1.5rem" }}>
+          <div className="stat-card stat-highlight">
+            <span className="stat-value">{mejora.ahorro}</span>
+            <span className="stat-label">Tokens Ahorrados ({mejora.recomendacion?.toUpperCase()})</span>
+          </div>
+        </div>
+      )}
 
       {/* Quality */}
       {prompt && <QualityCard prompt={prompt} />}
 
       {/* Improvement */}
       {!optimo && mejora && <ImprovementCard mejora={mejora} />}
-
-      {/* Stats */}
-      <div className="section-title"><h3>ESTADÍSTICAS</h3><div className="section-div" /></div>
-      <div className="stats-grid">
-        <div className="stat-card"><span className="stat-value">{tokens_orig}</span><span className="stat-label">Tokens (Original)</span></div>
-        <div className="stat-card"><span className="stat-value">{original?.split(" ").length}</span><span className="stat-label">Palabras (Original)</span></div>
-        <div className="stat-card"><span className="stat-value">{tokens_trad}</span><span className="stat-label">Tokens (Traducción)</span></div>
-        <div className="stat-card"><span className="stat-value">{traduccion?.split(" ").length}</span><span className="stat-label">Palabras (Traducción)</span></div>
-        {mejora && (
-          <div className="stat-card stat-highlight">
-            <span className="stat-value">{mejora.ahorro}</span>
-            <span className="stat-label">Tokens Ahorrados ({mejora.recomendacion?.toUpperCase()})</span>
-          </div>
-        )}
-      </div>
 
       {/* Model Footer */}
       {modelo && (
@@ -215,6 +218,7 @@ function ImprovementCard({ mejora }) {
 function ReviewsTab() {
   const [files, setFiles] = useState([]);
   const [optimizar, setOptimizar] = useState(true);
+  const [rapido, setRapido] = useState(true);
   const [columna, setColumna] = useState("");
   const [loading, setLoading] = useState(false);
   const [data, setData] = useState(null);
@@ -231,6 +235,7 @@ function ReviewsTab() {
       files.forEach((f) => form.append("archivos", f));
       form.append("columna", columna);
       form.append("optimizar", optimizar ? "true" : "false");
+      form.append("rapido", rapido ? "true" : "false");
       const res = await fetch(`${API}/api/reviews`, { method: "POST", body: form });
       if (!res.ok) { const d = await res.json(); throw new Error(d.detail || "Error"); }
       setData(await res.json());
@@ -292,6 +297,13 @@ function ReviewsTab() {
             <span className="toggle-label">Optimizar Tokens</span>
             <label className="toggle-switch">
               <input type="checkbox" checked={optimizar} onChange={(e) => setOptimizar(e.target.checked)} />
+              <span className="toggle-slider" />
+            </label>
+          </div>
+          <div className="toggle-wrapper">
+            <span className="toggle-label">Modo Rápido (solo heurística)</span>
+            <label className="toggle-switch">
+              <input type="checkbox" checked={rapido} onChange={(e) => setRapido(e.target.checked)} />
               <span className="toggle-slider" />
             </label>
           </div>

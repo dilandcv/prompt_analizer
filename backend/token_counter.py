@@ -8,7 +8,7 @@ try:
     import ollama
     OLLAMA_EVAL_MODEL = "qwen2.5:0.5b"
     OLLAMA_MEJORA_MODEL = "qwen2.5:0.5b"
-    _ollama_client = ollama.Client(timeout=10)
+    _ollama_client = ollama.Client(timeout=15)
     _ollama_disponible = True
 except ImportError:
     ollama = None
@@ -468,55 +468,47 @@ def generar_ejemplo_mejora(texto: str) -> dict:
 
 
 def _construir_mejora(texto: str) -> str:
-    """Genera un prompt mejorado con Qwen, apuntando a la rubrica de evaluacion."""
-    if _ollama_client is not None:
-        try:
-            prompt_ia = (
-                "Eres un experto en Prompt Engineering. Tu tarea es mejorar el "
-                "siguiente prompt para que obtenga una puntuacion mayor a 90 en "
-                "esta rubrica de 7 dimensiones (0-20 puntos cada una):\n\n"
-                "1. Claridad: instruccion directa y sin ambiguedades.\n"
-                "2. Contexto: suficiente informacion de fondo.\n"
-                "3. Objetivo: resultado esperado claramente definido.\n"
-                "4. Restricciones: limitaciones, tono, audiencia o reglas.\n"
-                "5. Formato: estructura deseada para la respuesta.\n"
-                "6. Especificidad: detalles concretos, ejemplos, no ser vago.\n"
-                "7. Coherencia: ideas bien organizadas y faciles de seguir.\n\n"
-                "Optimiza el prompt anadiendo elementos que fortalezcan cada "
-                "una de estas dimensiones. Responde en espanol. "
-                "NO respondas la pregunta del prompt original. "
-                "Responde SOLO con el prompt mejorado, sin explicaciones:\n\n"
-                f"\"{texto}\"\n\n"
-                "Prompt mejorado en espanol:"
-            )
-            mejora = _ollama_generate(
-                prompt_ia,
-                model=OLLAMA_MEJORA_MODEL,
-                max_tokens=150,
-                temperature=0.2,
-            )
-            if mejora and len(mejora) > 20:
-                return mejora
-        except Exception:
-            pass
+    """Construye una version mejorada del prompt usando una plantilla heuristica.
 
-    tiene_pregunta = bool(re.search(r"¿?\?$", texto.strip()))
+    Anade contexto, requisitos y formato de salida al prompt original para
+    hacerlo mas efectivo. No depende de Ollama para ser instantaneo.
+    """
+
+    tiene_pregunta = bool(re.search(r"\?$", texto.strip()))
     tiene_verbo = bool(re.search(
         r"\b(explica|describe|genera|crea|haz|escribe|traduce|analiza|compara|resume|lista)\b",
         texto.lower(),
     ))
+    ya_tiene_contexto = bool(re.search(
+        r"\b(eres|act[uú]a|imagina|supon|como si|rol|eres un|actua como)\b", texto.lower()
+    ))
+    ya_tiene_formato = bool(re.search(
+        r"\b(secciones|pasos|lista|tabla|json|markdown|esquema|estructura)\b", texto.lower()
+    ))
 
     partes = []
-    partes.append("Contexto:\nSoy un desarrollador que necesita una solucion clara y bien explicada.")
+
+    if not ya_tiene_contexto:
+        partes.append(
+            "Eres un asistente experto. Proporciona respuestas precisas, "
+            "bien fundamentadas y utiles para el usuario."
+        )
 
     if tiene_pregunta:
-        partes.append(f"Pregunta especifica:\n{texto}")
+        partes.append(f"Pregunta:\n{texto}")
     elif tiene_verbo:
         partes.append(f"Tarea:\n{texto}")
     else:
-        partes.append(f"Solicitud:\n{texto}")
+        partes.append(f"Tarea:\n{texto}")
 
-    partes.append("Requisitos:\n- Proporciona una respuesta detallada y bien estructurada.\n- Incluye ejemplos practicos.\n- Explica el razonamiento paso a paso.")
+    requisitos = []
+    if not ya_tiene_formato:
+        requisitos.append("Responde de forma estructurada, con secciones claras y bien organizadas.")
+    requisitos.append("Incluye ejemplos concretos que ilustren cada punto.")
+    requisitos.append("Explica el razonamiento paso a paso cuando sea relevante.")
+    requisitos.append("Se especifico: menciona detalles, nombres, cifras o casos de uso reales.")
+
+    partes.append("Requisitos:\n- " + "\n- ".join(requisitos))
 
     return "\n\n".join(partes)
 
@@ -669,14 +661,14 @@ def calcular_costo(tokens: int, precio_por_millon: float = None) -> float:
     return round(tokens / 1_000_000 * precio, 4)
 
 
-def clasificar_resenas_qwen(resenas: list, chunk_size: int = 30) -> list:
+def clasificar_resenas_qwen(resenas: list, chunk_size: int = 30, rapido: bool = False) -> list:
     """Clasifica reseñas usando Qwen 2.5 en lotes.
 
     Envía las reseñas en chunks para no exceder la ventana de contexto.
     Retorna una lista de dicts con error_type, component, severity,
     summary y category para cada reseña.
     """
-    if _ollama_client is None:
+    if rapido or _ollama_client is None:
         return [_clasificacion_fallback(r) for r in resenas]
 
     resultados = []
@@ -816,3 +808,157 @@ def leer_carpeta_excel(ruta_carpeta: str, columna: str = None) -> tuple:
         raise ValueError("No se encontraron reseñas en los archivos.")
 
     return todas_resenas, sorted(columnas_globales)
+
+
+# ═══════════════════════════════════════════
+#  Módulo: Análisis de Prompt por Rúbrica
+# ═══════════════════════════════════════════
+
+_RUBRICA_PATH = Path(__file__).parent / "criterios_evaluacion.json"
+try:
+    with open(_RUBRICA_PATH, "r", encoding="utf-8") as _f:
+        RUBRICA = json.load(_f)
+except (FileNotFoundError, json.JSONDecodeError):
+    RUBRICA = {}
+
+OLLAMA_RUBRIC_MODEL = "llama3:8b"
+
+
+def _analizar_prompt_por_rubrica(texto: str) -> dict:
+    """Evalua un prompt contra la rubrica usando llama3:8b con formato JSON."""
+    system_instruction = (
+        "Eres un Ingeniero de Prompts Senior y Auditor de LLMs.\n"
+        "Audita el prompt del usuario aplicando RIGIDAMENTE estos criterios:\n\n"
+        f"{json.dumps(RUBRICA, ensure_ascii=False, indent=2)}\n\n"
+        "Instrucciones:\n"
+        "1. Evalua cada criterio y calcula la puntuacion total de 1 a 100.\n"
+        "2. Divide el puntaje final entre 10 para dar una nota de 1.0 a 10.0.\n"
+        "3. Genera una version optimizada en espanol y otra en ingles.\n\n"
+        "Responde UNICAMENTE en JSON estricto, sin markdown ni texto extra:\n"
+        "{\n"
+        '  "calidad_score": <1.0 a 10.0>,\n'
+        '  "desglose_puntaje": {\n'
+        '    "claridad_y_objetivo": <0-25>,\n'
+        '    "concision_y_eficiencia_tokens": <0-25>,\n'
+        '    "contexto_y_restricciones": <0-20>,\n'
+        '    "estructura_y_formato": <0-15>,\n'
+        '    "idioma_y_tokenizacion": <0-15>\n'
+        "  },\n"
+        '  "analisis_critico": "justificacion de puntos restados segun la rubrica",\n'
+        '  "sugerencias": ["sugerencia 1", "sugerencia 2"],\n'
+        '  "prompt_optimizado_es": "version mejorada en espanol",\n'
+        '  "prompt_optimizado_en": "version mejorada en ingles"\n'
+        "}"
+    )
+    try:
+        response = _ollama_client.chat(
+            model=OLLAMA_RUBRIC_MODEL,
+            messages=[
+                {"role": "system", "content": system_instruction},
+                {"role": "user", "content": f"Prompt a auditar: {texto}"},
+            ],
+            options={"temperature": 0.1, "num_predict": 800},
+            format={"type": "json_object"},
+        )
+        return json.loads(response["message"]["content"])
+    except Exception as e:
+        raise RuntimeError(f"Error en la evaluacion por rubrica: {e}")
+
+
+def _analizar_por_rubrica_fallback(texto: str) -> dict:
+    """Evaluacion basica cuando la rubrica con Ollama no esta disponible."""
+    palabras = len(texto.split())
+    if palabras < 5:
+        score = 2.0
+        analisis = "Prompt extremadamente corto. Necesita mas contexto y especificidad."
+    elif palabras < 15:
+        score = 4.0
+        analisis = "Prompt basico. Agregar contexto, restricciones y formato de salida."
+    elif palabras < 40:
+        score = 6.0
+        analisis = "Prompt aceptable. Podria beneficiarse de ejemplos y restricciones explicitas."
+    else:
+        score = 7.5
+        analisis = "Prompt con buena cantidad de contexto. Refinar formato y concision."
+
+    return {
+        "calidad_score": score,
+        "desglose_puntaje": {
+            "claridad_y_objetivo": int(score * 2.5),
+            "concision_y_eficiencia_tokens": int(score * 2.5),
+            "contexto_y_restricciones": int(score * 2),
+            "estructura_y_formato": int(score * 1.5),
+            "idioma_y_tokenizacion": int(score * 1.5),
+        },
+        "analisis_critico": analisis,
+        "sugerencias": [
+            "Define un rol y audiencia para el modelo.",
+            "Especifica el formato de salida deseado (JSON, lista, secciones).",
+            "Agrega restricciones de tono, longitud o exclusiones.",
+        ],
+        "prompt_optimizado_es": texto,
+        "prompt_optimizado_en": texto,
+    }
+
+
+def analizar_prompt_rubrica(texto: str) -> dict:
+    """Pipeline completo de analisis por rubrica.
+
+    Evalua el prompt, genera versiones optimizadas en ES/EN, y
+    calcula el ahorro de tokens al usar la version en ingles.
+    """
+    texto = texto.strip()
+    if not texto:
+        return {"error": "El prompt no puede estar vacio."}
+
+    enc = tiktoken.get_encoding("cl100k_base")
+
+    try:
+        english_prompt = traducir(texto, "es", "en")
+    except Exception:
+        english_prompt = texto
+
+    tokens_es_orig = len(enc.encode(texto))
+    tokens_en_orig = len(enc.encode(english_prompt))
+
+    if _ollama_client is not None:
+        try:
+            ia_data = _analizar_prompt_por_rubrica(texto)
+        except Exception:
+            ia_data = _analizar_por_rubrica_fallback(texto)
+    else:
+        ia_data = _analizar_por_rubrica_fallback(texto)
+
+    opt_es = ia_data.get("prompt_optimizado_es", texto)
+    opt_en = ia_data.get("prompt_optimizado_en", english_prompt)
+
+    tokens_opt_es = len(enc.encode(opt_es)) if opt_es else 0
+    tokens_opt_en = len(enc.encode(opt_en)) if opt_en else 0
+
+    ahorro = max(0, tokens_es_orig - tokens_opt_en)
+    pct_ahorro = round(ahorro / tokens_es_orig * 100, 1) if tokens_es_orig > 0 else 0
+
+    return {
+        "original": {
+            "es_text": texto,
+            "es_tokens": tokens_es_orig,
+            "en_text": english_prompt,
+            "en_tokens": tokens_en_orig,
+        },
+        "evaluacion": {
+            "score": ia_data.get("calidad_score", 5.0),
+            "desglose": ia_data.get("desglose_puntaje", {}),
+            "analisis": ia_data.get("analisis_critico", ""),
+            "sugerencias": ia_data.get("sugerencias", []),
+        },
+        "optimizado": {
+            "es_text": opt_es,
+            "es_tokens": tokens_opt_es,
+            "en_text": opt_en,
+            "en_tokens": tokens_opt_en,
+        },
+        "ahorro": {
+            "tokens_ahorrados": ahorro,
+            "porcentaje_ahorro": pct_ahorro,
+        },
+    }
