@@ -6,7 +6,7 @@ from pydantic import BaseModel
 from typing import Optional
 import io, json as _json, tempfile, os as _os, csv as _csv
 
-from token_counter import (
+from backend.token_counter import (
     contar_tokens, traducir, detectar_idioma,
     analizar_prompt, generar_ejemplo_mejora, recomendar_modelo,
     leer_excel_resenas, leer_csv_resenas, extraer_texto_archivo,
