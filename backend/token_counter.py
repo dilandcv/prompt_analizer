@@ -662,24 +662,96 @@ def calcular_costo(tokens: int, precio_por_millon: float = None) -> float:
 
 
 def clasificar_resenas_qwen(resenas: list, chunk_size: int = 30, rapido: bool = False) -> list:
-    """Clasifica reseñas usando Qwen 2.5 en lotes.
+    """Clasifica reseñas con estrategia hibrida: local + LLM bajo demanda.
 
-    Envía las reseñas en chunks para no exceder la ventana de contexto.
-    Retorna una lista de dicts con error_type, component, severity,
-    summary y category para cada reseña.
+    1. Clasifica todo localmente (rapido).
+    2. Agrupa por clave compuesta (error_type|category|sentimiento).
+    3. Para grupos de baja confianza, llama al LLM una vez por grupo.
+    4. Procesa grupos en paralelo con ThreadPoolExecutor.
+    5. Cachea resultados de grupos identicos.
     """
-    if rapido or _ollama_client is None:
-        return [_clasificacion_fallback(r) for r in resenas]
+    import concurrent.futures, itertools
 
-    resultados = []
-    for i in range(0, len(resenas), chunk_size):
-        chunk = resenas[i : i + chunk_size]
-        try:
-            res = _clasificar_chunk_qwen(chunk)
-            resultados.extend(res if isinstance(res, list) else
-                              [_clasificacion_fallback(r) for r in chunk])
-        except Exception:
-            resultados.extend([_clasificacion_fallback(r) for r in chunk])
+    # ── Paso 1: Clasificacion local de todas las reseñas ──
+    locales = [_clasificacion_fallback(r) for r in resenas]
+
+    if rapido or _ollama_client is None:
+        return _limpiar_internos(locales)
+
+    # ── Paso 2: Agrupar por clave compuesta ──
+    grupos = {}
+    for i, c in enumerate(locales):
+        clave = f"{c['error_type']}|{c['category']}|{c['sentimiento']}"
+        if clave not in grupos:
+            grupos[clave] = {"indices": [], "confianza": 0.0, "textos": []}
+        g = grupos[clave]
+        g["indices"].append(i)
+        g["confianza"] += c["_confianza"]
+        g["textos"].append(resenas[i])
+
+    for g in grupos.values():
+        g["confianza"] = g["confianza"] / len(g["indices"]) if g["indices"] else 0
+
+    # ── Paso 3: Identificar grupos que necesitan LLM ──
+    cache_llm = {}
+    grupos_llm = []
+    for clave, g in grupos.items():
+        if g["confianza"] < 0.6 and len(g["textos"]) > 0:
+            grupos_llm.append((clave, g["textos"], g["indices"]))
+        else:
+            cache_llm[clave] = True
+
+    locales_count = len(grupos) - len(grupos_llm)
+    print(f"  [Reviews] {len(grupos)} grupos: {locales_count} locales (confianza >= 0.6), "
+          f"{len(grupos_llm)} requieren LLM")
+
+    # ── Paso 4: Llamar al LLM por grupo (concurrente) ──
+    if grupos_llm:
+        max_workers = min(len(grupos_llm), 4)
+        completados = [0]
+
+        def _clasificar_grupo_llm(clave, textos, indices):
+            if clave in cache_llm:
+                return indices, None, clave
+            try:
+                chunk = textos[:min(len(textos), chunk_size)]
+                resultado = _clasificar_chunk_qwen(chunk)
+                if isinstance(resultado, list) and len(resultado) == len(chunk):
+                    cache_llm[clave] = resultado[0]
+                    return indices, resultado, clave
+            except Exception:
+                pass
+            cache_llm[clave] = None
+            return indices, None, clave
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futuros = {ex.submit(_clasificar_grupo_llm, c, t, idx): c
+                       for c, t, idx in grupos_llm}
+            for futuro in concurrent.futures.as_completed(futuros):
+                indices, resultados_llm, clave = futuro.result()
+                completados[0] += 1
+                if resultados_llm:
+                    for j, idx in enumerate(indices):
+                        if j < len(resultados_llm):
+                            llm = resultados_llm[j]
+                            locales[idx]["error_type"] = llm.get("error_type", locales[idx]["error_type"])
+                            locales[idx]["component"] = llm.get("component", locales[idx]["component"])
+                            locales[idx]["severity"] = llm.get("severity", locales[idx]["severity"])
+                            locales[idx]["summary"] = llm.get("summary", locales[idx]["summary"])
+                            locales[idx]["category"] = llm.get("category", locales[idx]["category"])
+                    print(f"  [Reviews] LLM {completados[0]}/{len(grupos_llm)} OK '{clave}': "
+                          f"{len(indices)} reseñas")
+                else:
+                    print(f"  [Reviews] LLM {completados[0]}/{len(grupos_llm)} "
+                          f"fallback local '{clave}': {len(indices)} reseñas")
+
+    return _limpiar_internos(locales)
+
+
+def _limpiar_internos(resultados: list) -> list:
+    """Elimina campos internos antes de devolver los resultados."""
+    for r in resultados:
+        r.pop("_confianza", None)
     return resultados
 
 
@@ -714,42 +786,104 @@ def _clasificar_chunk_qwen(chunk: list) -> list:
 
 
 def _clasificacion_fallback(texto: str) -> dict:
-    """Clasificación por keywords cuando Qwen no está disponible."""
+    """Clasificacion local por keywords con confianza y sentimiento."""
     t = texto.lower()
+    confianza = 0.0
+
+    # ── Error type ──
     if any(p in t for p in ["cierra", "crash", "crashea", "congela", "reinicia"]):
-        err = "crash"
+        err = "crash"; confianza += 0.35
     elif any(p in t for p in ["lento", "lenta", "tarda", "demora"]):
-        err = "performance"
+        err = "performance"; confianza += 0.35
     elif any(p in t for p in ["no carga", "no abre", "pantalla blanca", "blanco"]):
-        err = "loading_failure"
+        err = "loading_failure"; confianza += 0.35
     elif any(p in t for p in ["error", "falla", "roto", "bug"]):
-        err = "bug"
-    elif any(p in t for p in ["quisiera", "sería bueno", "me gustaría", "sugiero"]):
-        err = "feature_request"
+        err = "bug"; confianza += 0.25
+    elif any(p in t for p in ["quisiera", "sería bueno", "me gustaría", "sugiero",
+                                "me encantaria", "me encantaría", "podrian", "podrían"]):
+        err = "feature_request"; confianza += 0.35
     else:
-        err = "other"
+        err = "other"; confianza += 0.1
 
+    # ── Component ──
     if any(p in t for p in ["foto", "imagen", "perfil", "galeria", "cámara", "camara"]):
-        comp = "profile_picture_upload"
-    elif any(p in t for p in ["pago", "compra", "tarjeta", "precio", "checkout"]):
-        comp = "payment_flow"
-    elif any(p in t for p in ["login", "sesión", "sesion", "contraseña", "registro"]):
-        comp = "authentication"
-    elif any(p in t for p in ["notificación", "notificacion", "aviso"]):
-        comp = "notifications"
+        comp = "profile_picture_upload"; confianza += 0.3
+    elif any(p in t for p in ["pago", "compra", "tarjeta", "precio", "checkout",
+                                "dinero", "cobro", "factura", "gratis", "costar"]):
+        comp = "payment_flow"; confianza += 0.3
+    elif any(p in t for p in ["login", "sesión", "sesion", "contraseña", "registro",
+                                "usuario", "autenticacion"]):
+        comp = "authentication"; confianza += 0.3
+    elif any(p in t for p in ["notificación", "notificacion", "aviso", "alerta",
+                                "mensaje", "email", "correo"]):
+        comp = "notifications"; confianza += 0.3
     else:
-        comp = "general_ui"
+        comp = "general_ui"; confianza += 0.1
 
-    if any(p in t for p in ["siempre", "cada vez", "constante", "todo el tiempo"]):
-        sev = "high"
-    elif any(p in t for p in ["a veces", "ocasional", "raro"]):
-        sev = "low"
+    # ── Severity ──
+    if any(p in t for p in ["siempre", "cada vez", "constante", "todo el tiempo",
+                             "inutilizable", "imposible", "no funciona", "nunca"]):
+        sev = "high"; confianza += 0.3
+    elif any(p in t for p in ["a veces", "ocasional", "raro", "de vez en cuando"]):
+        sev = "low"; confianza += 0.25
     else:
-        sev = "medium"
+        sev = "medium"; confianza += 0.15
+
+    # ── Sentimiento ──
+    positivo = ["excelente", "bueno", "buena", "genial", "increible", "increíble",
+                "me encanta", "me gusta", "recomiendo", "perfecto", "perfecta",
+                "maravilloso", "fantastico", "fantástico", "feliz", "contento",
+                "gracias", "rapido", "rápido", "facil", "fácil", "util", "útil",
+                "fluido", "estable", "bien", "mejor", "gran", "love", "great",
+                "awesome", "amazing", "excellent", "wonderful", "best"]
+    negativo = ["malo", "mala", "pesimo", "pésimo", "horrible", "terrible",
+                "decepcion", "decepción", "no sirve", "basura", "odio", "detesto",
+                "frustrante", "molesto", "lento", "problema", "defectuoso",
+                "no funciona", "no me gusta", "pesima", "pésima", "malisimo",
+                "malísimo", "pobre", "bad", "terrible", "worst", "awful",
+                "hate", "useless", "horrible", "worst", "poor", "never"]
+    cnt_pos = sum(1 for p in positivo if p in t)
+    cnt_neg = sum(1 for p in negativo if p in t)
+
+    if cnt_pos > cnt_neg:
+        sentimiento = "positivo"; confianza += 0.05 * min(cnt_pos, 5)
+    elif cnt_neg > cnt_pos:
+        sentimiento = "negativo"; confianza += 0.05 * min(cnt_neg, 5)
+    else:
+        sentimiento = "neutral"; confianza += 0.0
+
+    # ── Tópico ──
+    topicos = {
+        "envio": ["envio", "envío", "entrega", "llegada", "paquete", "shipping",
+                  "delivery", "recibi", "recibí", "tardo", "tardó"],
+        "producto": ["producto", "calidad", "material", "diseño", "product",
+                     "tamaño", "color", "modelo", "peso"],
+        "atencion": ["atencion", "atención", "servicio", "soporte", "cliente",
+                     "ayuda", "respond", "service", "support", "staff"],
+        "precio": ["precio", "costar", "caro", "barato", "precios", "cuesta",
+                   "coste", "money", "price", "expensive", "cheap", "cobrar",
+                   "descuento", "oferta"],
+        "funcionalidad": ["funciona", "util", "útil", "practico", "práctico",
+                          "sirve", "feature", "funcionalidad", "uso", "usar"],
+    }
+    topico = "general"
+    for nombre, keywords in topicos.items():
+        if any(k in t for k in keywords):
+            topico = nombre
+            confianza += 0.05
+            break
 
     return {
-        "error_type": err, "component": comp, "severity": sev,
-        "summary": texto[:120], "category": "bug" if err != "performance" else "performance",
+        "error_type": err,
+        "component": comp,
+        "severity": sev,
+        "summary": texto[:120],
+        "category": "bug" if err in ("crash", "bug", "loading_failure") else (
+            "performance" if err == "performance" else (
+            "feature" if err == "feature_request" else "other")),
+        "sentimiento": sentimiento,
+        "topico": topico,
+        "_confianza": min(confianza, 1.0),
     }
 
 
@@ -773,7 +907,7 @@ def leer_carpeta_excel(ruta_carpeta: str, columna: str = None) -> tuple:
         raise ValueError(f"No se encontraron archivos .xlsx en: {ruta_carpeta}")
 
     try:
-        import pandas as pd
+        import pandas
     except ImportError:
         pandas = None
 
@@ -783,7 +917,7 @@ def leer_carpeta_excel(ruta_carpeta: str, columna: str = None) -> tuple:
     for archivo in archivos_xlsx:
         try:
             if pandas is not None:
-                df = pd.read_excel(archivo, dtype=str)
+                df = pandas.read_excel(archivo, dtype=str)
                 headers = list(df.columns)
                 columnas_globales.update(headers)
 
@@ -962,3 +1096,364 @@ def analizar_prompt_rubrica(texto: str) -> dict:
             "porcentaje_ahorro": pct_ahorro,
         },
     }
+
+
+# ═══════════════════════════════════════════
+#  Módulo: Procesamiento de Citas Médicas
+# ═══════════════════════════════════════════
+
+_CITAS_POR_DIA = 15000
+
+
+def _detectar_columna_paciente_id(headers: list) -> str:
+    candidatos = ["paciente_id", "pacienteid", "id_paciente", "idpaciente",
+                  "id", "codigo", "codigo_paciente", "nro_paciente",
+                  "paciente", "historia", "hc"]
+    headers_lower = [h.lower().strip() for h in headers]
+    for c in candidatos:
+        if c in headers_lower:
+            return headers[headers_lower.index(c)]
+    return headers[0] if headers else ""
+
+
+def _detectar_columna_mensaje(headers: list) -> str:
+    candidatos = ["mensaje_texto", "mensaje", "mensajetexto", "texto",
+                  "texto_mensaje", "consulta", "solicitud", "descripcion",
+                  "descripción", "observacion", "observación", "nota",
+                  "comentario", "contenido", "detalle", "motivo"]
+    headers_lower = [h.lower().strip() for h in headers]
+    for c in candidatos:
+        if c in headers_lower:
+            return headers[headers_lower.index(c)]
+    return headers[1] if len(headers) > 1 else (headers[0] if headers else "")
+
+
+def leer_excel_citas_medicas(filepath: str, columna_id: str = None,
+                             columna_mensaje: str = None) -> tuple:
+    """Lee un Excel con datos de citas médicas.
+
+    Args:
+        filepath: ruta al archivo .xlsx.
+        columna_id: nombre de la columna con ID de paciente.
+        columna_mensaje: nombre de la columna con el mensaje de texto.
+
+    Returns:
+        (citas, headers) donde citas es list[dict] con paciente_id y
+        mensaje_texto, y headers es list[str] con los encabezados.
+    """
+    import openpyxl
+    wb = openpyxl.load_workbook(filepath, read_only=True)
+    ws = wb.active
+    rows = list(ws.iter_rows(values_only=True))
+    wb.close()
+
+    if not rows:
+        return [], []
+
+    headers = [str(h).strip() if h else "" for h in rows[0]]
+
+    id_col = columna_id or _detectar_columna_paciente_id(headers)
+    msg_col = columna_mensaje or _detectar_columna_mensaje(headers)
+
+    if id_col not in headers:
+        raise ValueError(f"Columna de ID '{id_col}' no encontrada. Columnas: {headers}")
+    if msg_col not in headers:
+        raise ValueError(f"Columna de mensaje '{msg_col}' no encontrada. Columnas: {headers}")
+
+    id_idx = headers.index(id_col)
+    msg_idx = headers.index(msg_col)
+
+    citas = []
+    for row in rows[1:]:
+        paciente_id = str(row[id_idx]).strip() if id_idx < len(row) and row[id_idx] else ""
+        mensaje = str(row[msg_idx]).strip() if msg_idx < len(row) and row[msg_idx] else ""
+        if mensaje and len(mensaje) > 3:
+            citas.append({"paciente_id": paciente_id, "mensaje_texto": mensaje})
+
+    return citas, headers
+
+
+def leer_carpeta_excel_citas(ruta_carpeta: str, columna_id: str = None,
+                             columna_mensaje: str = None) -> tuple:
+    """Lee una carpeta con Excels de citas médicas.
+
+    Args:
+        ruta_carpeta: ruta al directorio con archivos .xlsx.
+        columna_id: nombre de columna de ID de paciente.
+        columna_mensaje: nombre de columna de mensaje de texto.
+
+    Returns:
+        (citas, columnas_disponibles) donde citas es list[dict] y
+        columnas_disponibles es list[str].
+    """
+    carpeta = Path(ruta_carpeta)
+    if not carpeta.is_dir():
+        raise FileNotFoundError(f"La carpeta no existe: {ruta_carpeta}")
+
+    archivos_xlsx = sorted(carpeta.glob("*.xlsx"))
+    if not archivos_xlsx:
+        raise ValueError(f"No se encontraron archivos .xlsx en: {ruta_carpeta}")
+
+    try:
+        import pandas
+    except ImportError:
+        pandas = None
+
+    todas_citas = []
+    columnas_globales = set()
+
+    for archivo in archivos_xlsx:
+        try:
+            if pandas is not None:
+                df = pandas.read_excel(archivo, dtype=str)
+                headers = list(df.columns)
+                columnas_globales.update(headers)
+
+                id_col = columna_id or _detectar_columna_paciente_id(headers)
+                msg_col = columna_mensaje or _detectar_columna_mensaje(headers)
+
+                if id_col in df.columns and msg_col in df.columns:
+                    for _, row in df.iterrows():
+                        paciente_id = str(row[id_col]).strip() if pandas.notna(row[id_col]) else ""
+                        mensaje = str(row[msg_col]).strip() if pandas.notna(row[msg_col]) else ""
+                        if mensaje and len(mensaje) > 3:
+                            todas_citas.append({"paciente_id": paciente_id,
+                                                "mensaje_texto": mensaje})
+            else:
+                citas_archivo, headers = leer_excel_citas_medicas(
+                    str(archivo), columna_id, columna_mensaje
+                )
+                columnas_globales.update(headers)
+                todas_citas.extend(citas_archivo)
+        except Exception as e:
+            raise ValueError(f"Error al leer {archivo.name}: {e}")
+
+    if not todas_citas:
+        raise ValueError("No se encontraron citas médicas en los archivos.")
+
+    return todas_citas, sorted(columnas_globales)
+
+
+def extraer_esquema_medico(mensaje: str) -> dict:
+    """Extrae accion, especialidad y preferencia_horario del mensaje con
+    heuristica de keywords para no depender de Ollama en procesamiento batch.
+
+    Returns:
+        dict con accion, especialidad, preferencia_horario.
+    """
+    t = mensaje.lower()
+    palabras = set(re.findall(r"[a-záéíóúüñ]+", t))
+
+    acciones = [
+        ("reprogramar", ["reprogramar", "reagendar", "cambiar fecha",
+                         "cambiar hora", "mover cita", "cambio de fecha",
+                         "cambio de hora", "otra fecha", "otro dia",
+                         "otro día", "nueva fecha", "nuevo horario",
+                         "modificar", "reapertura", "reagendar cita"]),
+        ("cancelar", ["cancelar", "cancelacion", "cancelación",
+                      "anular", "baja", "suspender", "no asistir"]),
+        ("confirmar", ["confirmar", "confirmacion", "confirmación",
+                       "ratificar", "asegurar"]),
+        ("agendar", ["agendar", "solicitar cita", "nueva cita",
+                     "pedir cita", "reservar", "primera cita",
+                     "solicito", "necesito cita", "quiero cita",
+                     "pedir hora", "sacar hora"]),
+        ("consultar", ["consultar", "consulta", "duda", "pregunta",
+                       "informacion", "información", "orientacion",
+                       "orientación"]),
+    ]
+    accion = "consultar"
+    for nombre, keywords in acciones:
+        if any(k in t for k in keywords):
+            accion = nombre
+            break
+
+    especialidades = [
+        ("cardiologia", ["cardiolog", "corazon", "corazón", "cardiaco",
+                         "presion", "presión", "tension", "tensión",
+                         "electrocardiograma", "ecg"]),
+        ("dermatologia", ["dermatolog", "piel", "lunar", "acne", "acné",
+                          "erupcion", "erupción", "mancha", "alergia",
+                          "urticaria", "psoriasis"]),
+        ("pediatria", ["pediatr", "niño", "niña", "bebe", "bebé",
+                       "infantil", "lactante", "recien", "vacuna"]),
+        ("traumatologia", ["traumatolog", "fractura", "lesion", "lesión",
+                           "dolor articular", "rodilla", "columna",
+                           "hueso", "esguince", "luxacion", "luxación",
+                           "ortoped"]),
+        ("neurologia", ["neurolog", "migraña", "cefalea", "convulsion",
+                        "convulsión", "epilepsia", "mareo", "vertigo",
+                        "vértigo", "parkinson"]),
+        ("ginecologia", ["ginecolog", "obstetr", "embarazo", "menstruacion",
+                         "menstruación", "papanicolaou", "citologia",
+                         "citología"]),
+        ("oftalmologia", ["oftalmolog", "vista", "ojo", "vision", "visión",
+                          "catarata", "glaucoma", "lentes"]),
+        ("endocrinologia", ["endocrinolog", "diabetes", "tiroides",
+                            "hormona", "metabol", "glucosa", "insulina"]),
+        ("psiquiatria", ["psiquiatr", "ansiedad", "depresion", "depresión",
+                         "psicolog", "terapia", "insomnio", "estres",
+                         "estrés", "psicotico"]),
+        ("gastroenterologia", ["gastroenterolog", "digestivo", "estomago",
+                               "estómago", "intestino", "colon", "higado",
+                               "hígado", "gastritis", "reflujo", "acidez"]),
+        ("neumologia", ["neumolog", "pulmon", "pulmón", "respiratorio",
+                        "asma", "bronquitis", "epoc", "tos cronica"]),
+        ("urologia", ["urolog", "riñon", "riñón", "vejiga", "prostata",
+                      "próstata", "urinario"]),
+    ]
+    especialidad = "medicina_general"
+    for nombre, keywords in especialidades:
+        if any(k in t for k in keywords):
+            especialidad = nombre
+            break
+
+    horario_keywords = {
+        "mañana": {"mañana", "temprano", "madrugada", "matutino", "am", "a.m.",
+                   "primer turno", "primeras horas"},
+        "tarde": {"tarde", "mediodia", "mediodía", "vespertino", "pm", "p.m.",
+                  "segundo turno", "despues de almuerzo"},
+        "noche": {"noche", "nocturno", "ultimo turno", "último turno", "tarde noche"},
+    }
+    preferencia = "mañana"
+    for nombre, keywords in horario_keywords.items():
+        for k in keywords:
+            if " " in k:
+                if k in t:
+                    preferencia = nombre
+                    break
+            elif k in palabras:
+                preferencia = nombre
+                break
+        else:
+            continue
+        break
+
+    return {
+        "accion": accion,
+        "especialidad": especialidad,
+        "preferencia_horario": preferencia,
+    }
+
+
+# ═══════════════════════════════════════════
+#  Traducción por lotes (batch translation)
+# ═══════════════════════════════════════════
+
+_SEP = "\n|||SEP|||\n"
+_MAX_CHARS_LOTE = 4500
+
+
+def _traducir_lote(textos: list, idioma_origen: str) -> list:
+    """Traduce un lote de textos concatenandolos y dividiendo la respuesta.
+
+    Agrupa textos con un separador unico, los traduce en una sola llamada
+    a Google Translate y luego separa el resultado. Si la validacion falla
+    (las partes no coinciden con los textos originales), hace fallback a
+    traduccion individual.
+
+    Args:
+        textos: lista de textos en el idioma origen.
+        idioma_origen: "es" o "en".
+
+    Returns:
+        lista de traducciones en el mismo orden.
+    """
+    if not textos:
+        return []
+
+    destino = "en" if idioma_origen == "es" else "es"
+    total_chars = sum(len(t) for t in textos) + len(_SEP) * (len(textos) - 1)
+
+    # Si el lote es muy grande, dividir recursivamente
+    if total_chars > _MAX_CHARS_LOTE and len(textos) > 1:
+        mitad = len(textos) // 2
+        izq = _traducir_lote(textos[:mitad], idioma_origen)
+        der = _traducir_lote(textos[mitad:], idioma_origen)
+        return izq + der
+
+    if len(textos) == 1:
+        try:
+            return [traducir(textos[0], idioma_origen, destino)]
+        except Exception:
+            return [""]
+
+    texto_concatenado = _SEP.join(textos)
+
+    try:
+        traduccion = traducir(texto_concatenado, idioma_origen, destino)
+    except Exception:
+        return [""] * len(textos)
+
+    partes = traduccion.split(_SEP)
+    partes_limpias = [p.strip() for p in partes]
+
+    if len(partes_limpias) != len(textos):
+        return [_traducir_lote([t], idioma_origen)[0] for t in textos]
+
+    return partes_limpias
+
+
+# ═══════════════════════════════════════════
+#  Optimización de texto para reducir tokens
+# ═══════════════════════════════════════════
+
+_FRASES_REDUNDANTES = [
+    (r"(?i)^(i would like to|i want to|i need to|i'd like to|i have to|please)\s+", ""),
+    (r"(?i)^(i am writing to|i'm writing to)\s+", ""),
+    (r"(?i)^(i am requesting|i'm requesting)\s+", ""),
+    (r"(?i)^(this is to|this message is to)\s+", ""),
+    (r"(?i)\b(i would appreciate if you could|i'd appreciate if you could)\s+", ""),
+    (r"(?i),\s*please\b", ""),
+    (r"(?i),\s*thank you\b", ""),
+    (r"(?i)\b(kindly|just|simply|basically|actually|really|very)\s+", ""),
+    (r"(?i)\b(at your earliest convenience|as soon as possible)\b", ""),
+    (r"(?i)\b(i am|i'm)\s+", ""),
+    (r"(?i)\s*please\s+", " "),
+    (r"(?i)^(can you|could you|would you)\s+", ""),
+    (r"(?i)\b(my|our)\s+", ""),
+    (r"(?i)\b(for me|for us)\b", ""),
+]
+
+
+def optimizar_texto(texto: str, idioma_destino: str) -> str:
+    """Optimiza un texto para minimizar tokens conservando el significado.
+
+    Aplica reglas heuristicas para eliminar frases redundantes, muletillas,
+    y construcciones verbosas comunes sin alterar informacion medica,
+    fechas, nombres propios ni datos criticos.
+
+    Args:
+        texto: texto ya traducido al idioma destino.
+        idioma_destino: "en" o "es".
+
+    Returns:
+        texto optimizado con menos tokens.
+    """
+    if not texto or not texto.strip():
+        return texto
+
+    t = texto.strip()
+
+    if idioma_destino == "en":
+        for patron, reemplazo in _FRASES_REDUNDANTES:
+            t = re.sub(patron, reemplazo, t)
+
+    t = re.sub(r"\s{2,}", " ", t).strip()
+    t = re.sub(r"\s+\.", ".", t)
+    t = re.sub(r"\s+,", ",", t)
+
+    if t and t[0].islower():
+        t = t[0].upper() + t[1:]
+
+    if len(t) < 5 and len(texto) > 5:
+        return texto
+
+    return t if t else texto
+
+
+def _calcular_ahorro(tokens_original: int, tokens_optimizado: int) -> dict:
+    """Calcula metricas de ahorro entre tokens originales y optimizados."""
+    ahorro = max(0, tokens_original - tokens_optimizado)
+    pct = round(ahorro / tokens_original * 100, 1) if tokens_original > 0 else 0.0
+    return {"ahorro": ahorro, "pct_reduccion": pct}

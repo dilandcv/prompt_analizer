@@ -23,6 +23,9 @@ function Tabs({ active, onTab }) {
       <button className={`tab ${active === "reviews" ? "active" : ""}`} onClick={() => onTab("reviews")}>
         Caso 2 · Reseñas Excel
       </button>
+      <button className={`tab ${active === "citas" ? "active" : ""}`} onClick={() => onTab("citas")}>
+        Caso 3 · Citas Médicas
+      </button>
     </nav>
   );
 }
@@ -389,6 +392,208 @@ function ReviewsTab() {
   );
 }
 
+/* ─── CITAS TAB ─── */
+
+function CitasTab() {
+  const [files, setFiles] = useState([]);
+  const [carpeta, setCarpeta] = useState("");
+  const [modo, setModo] = useState("archivo");
+  const [optimizar, setOptimizar] = useState(true);
+  const [loading, setLoading] = useState(false);
+  const [data, setData] = useState(null);
+  const [error, setError] = useState("");
+  const [page, setPage] = useState(0);
+  const pageSize = 15;
+
+  async function processCitas(e) {
+    e.preventDefault();
+    setError(""); setData(null);
+
+    try {
+      if (modo === "archivo") {
+        if (files.length === 0) {
+          setError("Selecciona al menos un archivo.");
+          return;
+        }
+        setLoading(true);
+        const form = new FormData();
+        files.forEach((f) => form.append("archivos", f));
+        form.append("optimizar_tokens", optimizar ? "true" : "false");
+        const res = await fetch(`${API}/api/citas/analyze`, { method: "POST", body: form });
+        if (!res.ok) { const d = await res.json(); throw new Error(d.detail || "Error"); }
+        setData(await res.json());
+      } else {
+        if (!carpeta.trim()) {
+          setError("Ingresa una ruta de carpeta.");
+          return;
+        }
+        setLoading(true);
+        const form = new FormData();
+        form.append("carpeta", carpeta);
+        form.append("optimizar_tokens", optimizar ? "true" : "false");
+        const res = await fetch(`${API}/api/citas/analyze/folder`, { method: "POST", body: form });
+        if (!res.ok) { const d = await res.json(); throw new Error(d.detail || "Error"); }
+        setData(await res.json());
+      }
+    } catch (err) {
+      setError(err.message);
+      setData(null);
+    }
+    setLoading(false);
+  }
+
+  function exportFile(fmt) {
+    if (!data?.resultados) return;
+    fetch(`${API}/api/citas/export/${fmt}`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ resultados: data.resultados }),
+    }).then((r) => r.blob()).then((b) => {
+      const url = URL.createObjectURL(b);
+      const a = document.createElement("a");
+      a.href = url; a.download = `citas.${fmt === "xlsx" ? "xlsx" : fmt}`;
+      a.click(); URL.revokeObjectURL(url);
+    });
+  }
+
+  const totalPages = data ? Math.ceil(data.resultados.length / pageSize) : 0;
+  const pageData = data ? data.resultados.slice(page * pageSize, (page + 1) * pageSize) : [];
+
+  return (
+    <div>
+      <section style={{ marginBottom: "3rem" }}>
+        <form onSubmit={processCitas}>
+          <div style={{ display: "flex", gap: "0.5rem", marginBottom: "0.75rem" }}>
+            <button type="button" className={`btn-sm ${modo === "archivo" ? "btn-primary" : ""}`}
+                    onClick={() => setModo("archivo")} style={{ borderRadius: "var(--radius-xs)", fontSize: "0.75rem", padding: "0.4rem 1rem" }}>
+              Archivo
+            </button>
+            <button type="button" className={`btn-sm ${modo === "carpeta" ? "btn-primary" : ""}`}
+                    onClick={() => setModo("carpeta")} style={{ borderRadius: "var(--radius-xs)", fontSize: "0.75rem", padding: "0.4rem 1rem" }}>
+              Carpeta
+            </button>
+          </div>
+
+          {modo === "archivo" ? (
+            <div className="input-row">
+              <label className="attach-btn" title="Adjuntar archivos Excel" style={{ width: "100%", justifyContent: "center" }}>
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+                <span style={{ marginLeft: "0.5rem", fontSize: "0.8rem" }}>
+                  {files.length > 0 ? `${files.length} archivo(s)` : "Seleccionar archivos Excel"}
+                </span>
+                <input type="file" accept=".xlsx" multiple
+                       onChange={(e) => setFiles(Array.from(e.target.files))}
+                       style={{ display: "none" }} />
+              </label>
+            </div>
+          ) : (
+            <div className="textarea-wrap">
+              <input
+                type="text"
+                value={carpeta}
+                onChange={(e) => setCarpeta(e.target.value)}
+                placeholder="Ruta de carpeta con archivos .xlsx..."
+                style={{ width: "100%", padding: "0.75rem", background: "var(--bg-input)", border: "1px solid var(--border-default)", borderRadius: "var(--radius-xs)", color: "var(--text-primary)", fontSize: "0.85rem" }}
+              />
+            </div>
+          )}
+
+          {modo === "archivo" && files.length > 0 && (
+            <p style={{ fontSize: "0.72rem", color: "var(--accent)", marginTop: "0.4rem" }}>
+              {files.map((f) => f.name).join(", ")}
+            </p>
+          )}
+
+          {data?.columnas_disponibles?.length > 0 && (
+            <p style={{ fontSize: "0.72rem", color: "var(--text-muted)", marginTop: "0.4rem" }}>
+              Columnas: {data.columnas_disponibles.join(", ")}
+            </p>
+          )}
+
+          <div className="toggle-wrapper">
+            <span className="toggle-label">Optimizar Tokens (traducir y comparar ES vs EN)</span>
+            <label className="toggle-switch">
+              <input type="checkbox" checked={optimizar} onChange={(e) => setOptimizar(e.target.checked)} />
+              <span className="toggle-slider" />
+            </label>
+          </div>
+
+          <div className="btn-wrap">
+            <button type="submit" className="btn btn-primary" disabled={loading}>
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+              {loading ? "Procesando..." : "PROCESAR CITAS"}
+            </button>
+          </div>
+        </form>
+      </section>
+
+      {error && <div className="error-card"><span className="error-icon">!</span><p>{error}</p></div>}
+
+      {data && (
+        <div className="fade-in">
+          {/* Stats */}
+          <div className="section-title"><h3>RESUMEN DE OPTIMIZACIÓN</h3><div className="section-div" /></div>
+          <div className="stats-grid" style={{ marginBottom: "1.5rem" }}>
+            <div className="stat-card"><span className="stat-value">{data.stats.total_registros}</span><span className="stat-label">Registros</span></div>
+            <div className="stat-card"><span className="stat-value">{data.stats.tokens_originales?.toLocaleString()}</span><span className="stat-label">Tokens Originales</span></div>
+            <div className="stat-card"><span className="stat-value">{data.stats.tokens_optimizados?.toLocaleString()}</span><span className="stat-label">Tokens Optimizados</span></div>
+            <div className="stat-card stat-highlight"><span className="stat-value">{data.stats.tokens_ahorrados?.toLocaleString()} ({data.stats.porcentaje_reduccion}%)</span><span className="stat-label">Ahorro Total</span></div>
+          </div>
+
+          {/* Econ Simulation */}
+          <div className="section-title"><h3>SIMULACIÓN ECONÓMICA</h3><div className="section-div" /></div>
+          <p style={{ fontSize: "0.78rem", color: "var(--text-muted)", marginBottom: "0.75rem" }}>15.000 citas/día · 30 días · $2.50 USD / 1M tokens</p>
+          <div className="stats-grid" style={{ marginBottom: "1.5rem" }}>
+            <div className="stat-card"><span className="stat-value">${data.stats.costo_mensual_original?.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span><span className="stat-label">Costo Mensual (Original)</span></div>
+            <div className="stat-card"><span className="stat-value">${data.stats.costo_mensual_optimizado?.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span><span className="stat-label">Costo Mensual (Optimizado)</span></div>
+            <div className="stat-card stat-highlight"><span className="stat-value">${data.stats.ahorro_mensual?.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span><span className="stat-label">Ahorro Mensual</span></div>
+          </div>
+
+          {/* Table */}
+          <div className="section-title"><h3>RESULTADOS</h3><div className="section-div" /></div>
+          <div style={{ display: "flex", gap: "0.5rem", marginBottom: "1rem", flexWrap: "wrap" }}>
+            <button className="btn-sm" onClick={() => exportFile("csv")}>CSV</button>
+            <button className="btn-sm" onClick={() => exportFile("xlsx")}>Excel</button>
+            <button className="btn-sm" onClick={() => exportFile("json")}>JSON</button>
+          </div>
+
+          <div style={{ overflowX: "auto", border: "1px solid var(--border-subtle)", borderRadius: "var(--radius-sm)", marginBottom: "1rem" }}>
+            <table className="batch-table">
+              <thead><tr>
+                <th>#</th><th>ID</th><th>Original</th><th>Traducción</th><th>Optimizado</th><th>Idioma</th><th>Tok Orig</th><th>Tok Trad</th><th>Tok Opt</th><th>Ahorro</th><th>%</th>
+              </tr></thead>
+              <tbody>
+                {pageData.map((r, i) => (
+                  <tr key={i}>
+                    <td>{page * pageSize + i + 1}</td>
+                    <td>{r.paciente_id || "-"}</td>
+                    <td className="review-cell" title={r.original}>{r.original?.slice(0, 45)}{r.original?.length > 45 ? "…" : ""}</td>
+                    <td className="review-cell" title={r.traduccion}>{r.traduccion?.slice(0, 45)}{r.traduccion?.length > 45 ? "…" : ""}</td>
+                    <td className="review-cell" title={r.texto_optimizado}>{r.texto_optimizado?.slice(0, 45)}{r.texto_optimizado?.length > 45 ? "…" : ""}</td>
+                    <td><span className={`badge ${r.idioma === "es" ? "es" : "en"}`}>{r.idioma?.toUpperCase()}</span></td>
+                    <td>{r.tokens_original}</td>
+                    <td>{r.tokens_traduccion}</td>
+                    <td>{r.tokens_optimizado}</td>
+                    <td>{r.tokens_ahorrados}</td>
+                    <td><span style={{ color: r.porcentaje_reduccion > 0 ? "var(--success)" : "var(--text-muted)" }}>{r.porcentaje_reduccion}%</span></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          <div className="pagination">
+            <button disabled={page === 0} onClick={() => setPage(0)}>&laquo;</button>
+            <button disabled={page === 0} onClick={() => setPage(page - 1)}>&lsaquo;</button>
+            <span>{page + 1} / {totalPages}</span>
+            <button disabled={page >= totalPages - 1} onClick={() => setPage(page + 1)}>&rsaquo;</button>
+            <button disabled={page >= totalPages - 1} onClick={() => setPage(totalPages - 1)}>&raquo;</button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 /* ─── APP ─── */
 
 export default function App() {
@@ -409,6 +614,7 @@ export default function App() {
           </>
         )}
         {tab === "reviews" && <ReviewsTab />}
+        {tab === "citas" && <CitasTab />}
       </div>
     </>
   );

@@ -15,6 +15,9 @@ from backend.token_counter import (
     leer_carpeta_excel,
     clasificar_resenas_qwen, calcular_costo, contar_tokens_texto,
     analizar_prompt_rubrica,
+    leer_excel_citas_medicas, leer_carpeta_excel_citas,
+    extraer_esquema_medico, _traducir_lote,
+    optimizar_texto, _calcular_ahorro,
     _RESENAS_POR_DIA, _DIAS_POR_MES,
 )
 
@@ -94,7 +97,7 @@ def _procesar_resenas(todas_resenas: list, optimizar: bool, rapido: bool = False
         tokens_es = contar_tokens_texto(texto)
         tokens_en = tokens_es
         traduccion = ""
-        if optimizar and not rapido:
+        if optimizar:
             try:
                 traduccion = traducir(texto, "es", "en")
                 tokens_en = contar_tokens_texto(traduccion)
@@ -146,6 +149,11 @@ async def process_reviews(
     optimizar: bool = Form(False),
     rapido: bool = Form(False),
 ):
+    import time
+    t_total = time.perf_counter()
+
+    # ── Lectura de archivos ──
+    t0 = time.perf_counter()
     todas_resenas = []
     columnas_globales = set()
 
@@ -182,19 +190,41 @@ async def process_reviews(
 
     if not todas_resenas:
         raise HTTPException(400, "No se encontraron reseñas en los archivos.")
+    t1 = time.perf_counter()
 
+    # ── Procesamiento (tokens + traduccion) ──
     resultados = _procesar_resenas(todas_resenas, optimizar, rapido)
     total_es = sum(r["tokens_es"] for r in resultados)
     total_en = sum(r["tokens_en"] for r in resultados)
+    t2 = time.perf_counter()
 
+    # ── Clasificacion ──
     textos_para_clasificar = [r["traduccion"] if (optimizar and r["traduccion"]) else r["original"] for r in resultados]
     clasificaciones = clasificar_resenas_qwen(textos_para_clasificar, rapido=rapido)
     for i, r in enumerate(resultados):
         if i < len(clasificaciones):
             r["clasificacion"] = clasificaciones[i]
         r["costo"] = calcular_costo(r["tokens_en"] if optimizar else r["tokens_es"])
+    t3 = time.perf_counter()
 
+    # ── Stats ──
     stats = _calcular_stats(resultados, total_es, total_en)
+    t4 = time.perf_counter()
+
+    # ── Perfilado ──
+    n = len(todas_resenas)
+    n_grupos = len(set(
+        f"{c.get('error_type','')}|{c.get('category','')}|{c.get('sentimiento','')}"
+        for c in clasificaciones
+    ))
+    print(f"""
+========== PERFIL DE EJECUCION ==========
+  Lectura Excel........{t1 - t0:.2f}s  ({n} reseñas)
+  Tokens + traduccion..{t2 - t1:.2f}s
+  Clasificacion........{t3 - t2:.2f}s  ({n_grupos} grupos detectados)
+  Stats................{t4 - t3:.3f}s
+  TOTAL................{t4 - t_total:.2f}s
+=========================================""")
 
     return {
         "resultados": resultados,
@@ -301,6 +331,410 @@ async def export_reviews(formato: str, body: ExportRequest):
         return StreamingResponse(out,
                                  media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                                  headers={"Content-Disposition": "attachment; filename=reviews.xlsx"})
+
+    raise HTTPException(400, "Formato no soportado")
+
+
+# ═══════════════════════════════════════════
+#  Caso 3 — Citas Médicas
+# ═══════════════════════════════════════════
+
+_CITAS_POR_DIA = 15000
+
+
+def _procesar_mensaje_cita(texto: str, optimizar: bool) -> dict:
+    """Pipeline completo de optimizacion de un mensaje.
+
+    1. Contar tokens en español
+    2. Traducir al ingles
+    3. Verificar que la traduccion no este vacia
+    4. Optimizar el texto traducido
+    5. Contar tokens del texto optimizado
+    6. Calcular ahorro y costos
+    """
+    tokens_es = contar_tokens_texto(texto)
+    idioma_detectado = detectar_idioma(texto)
+
+    costo_orig = calcular_costo(tokens_es)
+
+    if not optimizar:
+        return {
+            "original": texto,
+            "traduccion": "",
+            "texto_optimizado": texto,
+            "idioma": idioma_detectado,
+            "tokens_original": tokens_es,
+            "tokens_traduccion": tokens_es,
+            "tokens_optimizado": tokens_es,
+            "tokens_ahorrados": 0,
+            "porcentaje_reduccion": 0.0,
+            "costo_original": costo_orig,
+            "costo_optimizado": costo_orig,
+        }
+
+    # ── Traducir ──
+    try:
+        if idioma_detectado == "es":
+            traduccion = traducir(texto, "es", "en")
+            idioma_opt = "en"
+        else:
+            traduccion = traducir(texto, "en", "es")
+            idioma_opt = "es"
+    except Exception as e:
+        print(f"  [DEBUG] Error traduciendo: {e}")
+        traduccion = ""
+
+    if not traduccion or not traduccion.strip():
+        print(f"  [DEBUG] Traduccion vacia para: {texto[:60]}...")
+        return {
+            "original": texto,
+            "traduccion": "",
+            "texto_optimizado": texto,
+            "idioma": idioma_detectado,
+            "tokens_original": tokens_es,
+            "tokens_traduccion": tokens_es,
+            "tokens_optimizado": tokens_es,
+            "tokens_ahorrados": 0,
+            "porcentaje_reduccion": 0.0,
+            "costo_original": costo_orig,
+            "costo_optimizado": costo_orig,
+        }
+
+    tokens_trad = contar_tokens_texto(traduccion)
+
+    # ── Optimizar ──
+    texto_opt = optimizar_texto(traduccion, idioma_opt)
+    if not texto_opt or not texto_opt.strip():
+        print(f"  [DEBUG] Optimizacion vacia, usando traduccion literal")
+        texto_opt = traduccion
+
+    tokens_opt = contar_tokens_texto(texto_opt)
+    metrica = _calcular_ahorro(tokens_es, tokens_opt)
+    costo_opt = calcular_costo(tokens_opt)
+
+    print(f"  [DEBUG] Original ({tokens_es}t): {texto[:50]}...")
+    print(f"  [DEBUG] Traduccion ({tokens_trad}t): {traduccion[:50]}...")
+    print(f"  [DEBUG] Optimizado ({tokens_opt}t): {texto_opt[:50]}...")
+    print(f"  [DEBUG] Ahorro: {metrica['ahorro']}t ({metrica['pct_reduccion']}%)")
+
+    return {
+        "original": texto,
+        "traduccion": traduccion,
+        "texto_optimizado": texto_opt,
+        "idioma": idioma_opt,
+        "tokens_original": tokens_es,
+        "tokens_traduccion": tokens_trad,
+        "tokens_optimizado": tokens_opt,
+        "tokens_ahorrados": metrica["ahorro"],
+        "porcentaje_reduccion": metrica["pct_reduccion"],
+        "costo_original": costo_orig,
+        "costo_optimizado": costo_opt,
+    }
+
+
+def _procesar_citas_batch(citas: list, optimizar: bool) -> list:
+    """Pipeline de optimizacion con agrupacion inteligente.
+
+    Fase 1: extrae esquema medico y cuenta tokens (local).
+    Fase 2: agrupa por clave compuesta (accion|especialidad|idioma).
+    Fase 3: traduce cada grupo en lote.
+    Fase 4: optimiza cada texto y calcula ahorro.
+    """
+    import time, itertools, concurrent.futures
+
+    t_total = time.time()
+
+    # ── Fase 1: Schemas + conteo ──
+    t0 = time.time()
+    mensajes = []
+    for cita in citas:
+        texto = cita["mensaje_texto"]
+        tokens_es = contar_tokens_texto(texto)
+        idioma = detectar_idioma(texto)
+        esquema = extraer_esquema_medico(texto)
+        clave = f"{esquema['accion']}|{esquema['especialidad']}|{idioma}"
+        costo_orig = calcular_costo(tokens_es)
+        mensajes.append({
+            "paciente_id": cita.get("paciente_id", ""),
+            "original": texto,
+            "traduccion": "",
+            "texto_optimizado": texto,
+            "idioma": idioma,
+            "tokens_original": tokens_es,
+            "tokens_traduccion": tokens_es,
+            "tokens_optimizado": tokens_es,
+            "tokens_ahorrados": 0,
+            "porcentaje_reduccion": 0.0,
+            "costo_original": costo_orig,
+            "costo_optimizado": costo_orig,
+            "_clave": clave,
+            "_idioma_orig": idioma,
+        })
+    t1 = time.time()
+    total = len(mensajes)
+
+    # ── Fase 2: Agrupamiento ──
+    mensajes.sort(key=lambda m: m["_clave"])
+    grupos = {k: list(g) for k, g in itertools.groupby(mensajes, key=lambda m: m["_clave"])}
+    t2 = time.time()
+
+    # ── Fase 3+4: Traduccion + optimizacion por grupo ──
+    errores = 0
+    if optimizar and grupos:
+        grupos_lista = list(grupos.items())
+        max_workers = min(len(grupos_lista), 5)
+        completados = [0]
+        total_grupos = len(grupos_lista)
+
+        def _procesar_grupo(item):
+            clave, grupo = item
+            textos = [m["original"] for m in grupo]
+            idioma_orig = grupo[0]["_idioma_orig"]
+            traducciones = _traducir_lote(textos, idioma_orig)
+
+            errs = 0
+            for j, m in enumerate(grupo):
+                trad = traducciones[j] if j < len(traducciones) and traducciones[j] else ""
+                if not trad:
+                    errs += 1
+                    continue
+
+                idioma_opt = "en" if idioma_orig == "es" else "es"
+                tokens_trad = contar_tokens_texto(trad)
+                m["traduccion"] = trad
+                m["tokens_traduccion"] = tokens_trad
+
+                texto_opt = optimizar_texto(trad, idioma_opt)
+                if not texto_opt or not texto_opt.strip():
+                    texto_opt = trad
+
+                tokens_opt = contar_tokens_texto(texto_opt)
+                metrica = _calcular_ahorro(m["tokens_original"], tokens_opt)
+
+                m["texto_optimizado"] = texto_opt
+                m["idioma"] = idioma_opt
+                m["tokens_optimizado"] = tokens_opt
+                m["tokens_ahorrados"] = metrica["ahorro"]
+                m["porcentaje_reduccion"] = metrica["pct_reduccion"]
+                m["costo_optimizado"] = calcular_costo(tokens_opt)
+
+            return clave, len(grupo), errs
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futuros = {ex.submit(_procesar_grupo, g): g for g in grupos_lista}
+            for futuro in concurrent.futures.as_completed(futuros):
+                clave, tam, errs = futuro.result()
+                completados[0] += 1
+                errores += errs
+                print(f"  [Citas] Grupo {completados[0]}/{total_grupos} '{clave}': "
+                      f"{tam} mensajes" + (f" ({errs} errores)" if errs else ""))
+
+        print(f"  [Citas] Agrupacion: {total_grupos} grupos desde {total} mensajes "
+              f"({total} traducciones -> {total_grupos} lotes)")
+    else:
+        print(f"  [Citas] {total} mensajes procesados (sin optimizar)")
+
+    t3 = time.time()
+
+    # ── Limpiar internos ──
+    for m in mensajes:
+        m.pop("_clave", None)
+        m.pop("_idioma_orig", None)
+
+    # ── Perfilado ──
+    if optimizar:
+        ahorro_total = sum(m["tokens_ahorrados"] for m in mensajes)
+        total_orig = sum(m["tokens_original"] for m in mensajes)
+        pct = round(ahorro_total / total_orig * 100, 1) if total_orig else 0
+        print(f"""
+===== PERFIL DE OPTIMIZACION =====
+  Schemas + conteo......{t1 - t0:.2f}s  ({total} mensajes)
+  Agrupamiento..........{t2 - t1:.2f}s  ({len(grupos)} grupos)
+  Traduccion + optim....{t3 - t2:.2f}s  ({len(grupos)} lotes, {max_workers if optimizar and grupos else 0} workers, {errores} errores)
+  TOTAL.................{t3 - t_total:.2f}s
+  Ahorro global.........{ahorro_total} tokens ({pct}%)
+====================================""")
+    else:
+        print(f"  [Citas] {total} mensajes procesados (sin optimizar)")
+
+    return mensajes
+
+
+def _calcular_stats_citas(resultados: list) -> dict:
+    """Resumen global de la optimizacion."""
+    n = len(resultados)
+    total_orig = sum(r["tokens_original"] for r in resultados) if n else 0
+    total_opt = sum(r["tokens_optimizado"] for r in resultados) if n else 0
+    total_ahorro = sum(r["tokens_ahorrados"] for r in resultados) if n else 0
+    pct_global = round(total_ahorro / total_orig * 100, 1) if total_orig > 0 else 0.0
+
+    costo_diario_orig = calcular_costo(total_orig * _CITAS_POR_DIA / n) if n else 0
+    costo_diario_opt = calcular_costo(total_opt * _CITAS_POR_DIA / n) if n else 0
+    costo_mensual_orig = round(costo_diario_orig * _DIAS_POR_MES, 2)
+    costo_mensual_opt = round(costo_diario_opt * _DIAS_POR_MES, 2)
+
+    return {
+        "total_registros": n,
+        "tokens_originales": total_orig,
+        "tokens_optimizados": total_opt,
+        "tokens_ahorrados": total_ahorro,
+        "porcentaje_reduccion": pct_global,
+        "costo_mensual_original": costo_mensual_orig,
+        "costo_mensual_optimizado": costo_mensual_opt,
+        "ahorro_mensual": round(costo_mensual_orig - costo_mensual_opt, 2),
+    }
+
+
+@app.post("/api/citas/analyze")
+async def analyze_citas(
+    archivos: list[UploadFile] = File(...),
+    optimizar_tokens: bool = Form(True),
+):
+    """Procesa archivos Excel con citas médicas.
+
+    Columnas esperadas: paciente_id, mensaje_texto.
+    Si optimizar_tokens=True, traduce cada mensaje y compara tokens ES vs EN.
+    """
+    t0 = _time.time()
+    todas_citas = []
+    columnas_globales = set()
+
+    for archivo in archivos:
+        if not archivo.filename:
+            continue
+        ext = archivo.filename.rsplit(".", 1)[-1].lower() if "." in archivo.filename else ""
+        if ext not in ("xlsx",):
+            continue
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix="." + ext)
+        tmp.write(await archivo.read())
+        tmp.close()
+        try:
+            citas, headers = leer_excel_citas_medicas(tmp.name)
+            todas_citas.extend(citas)
+            columnas_globales.update(headers)
+        finally:
+            try:
+                _os.unlink(tmp.name)
+            except OSError:
+                pass
+
+    if not todas_citas:
+        raise HTTPException(400, "No se encontraron citas médicas en los archivos.")
+
+    t1 = _time.time()
+    resultados = _procesar_citas_batch(todas_citas, optimizar_tokens)
+    t2 = _time.time()
+    stats = _calcular_stats_citas(resultados)
+    t3 = _time.time()
+
+    n = len(todas_citas)
+    print(f"[Citas] {n} mensajes | lectura={t1 - t0:.2f}s | procesamiento={t2 - t1:.2f}s | stats={t3 - t2:.3f}s | total={t3 - t0:.2f}s")
+
+    return {
+        "resultados": resultados,
+        "stats": stats,
+        "columnas_disponibles": sorted(columnas_globales),
+        "optimizar_tokens": optimizar_tokens,
+    }
+
+
+@app.post("/api/citas/analyze/folder")
+async def analyze_citas_folder(
+    carpeta: str = Form(...),
+    optimizar_tokens: bool = Form(True),
+):
+    """Procesa una carpeta con Excels de citas médicas.
+
+    Recorre automaticamente todos los *.xlsx de la carpeta.
+    """
+    if not carpeta.strip():
+        raise HTTPException(400, "Debe especificar una ruta de carpeta.")
+
+    t0 = _time.time()
+    try:
+        todas_citas, columnas_globales = leer_carpeta_excel_citas(carpeta.strip())
+    except FileNotFoundError as e:
+        raise HTTPException(400, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+    if not todas_citas:
+        raise HTTPException(400, "No se encontraron citas médicas en la carpeta.")
+
+    t1 = _time.time()
+    resultados = _procesar_citas_batch(todas_citas, optimizar_tokens)
+    t2 = _time.time()
+    stats = _calcular_stats_citas(resultados)
+    t3 = _time.time()
+
+    n = len(todas_citas)
+    print(f"[Citas Folder] {n} mensajes | lectura={t1 - t0:.2f}s | procesamiento={t2 - t1:.2f}s | stats={t3 - t2:.3f}s | total={t3 - t0:.2f}s")
+
+    return {
+        "resultados": resultados,
+        "stats": stats,
+        "columnas_disponibles": columnas_globales,
+        "optimizar_tokens": optimizar_tokens,
+    }
+
+
+@app.post("/api/citas/export/{formato}")
+async def export_citas(formato: str, body: ExportRequest):
+    """Exporta resultados de optimizacion en JSON, CSV o XLSX.
+
+    Incluye: texto original, texto optimizado, idioma, tokens antes/despues,
+    ahorro y porcentaje de reduccion.
+    """
+    resultados = body.resultados
+    if not resultados:
+        raise HTTPException(400, "Sin datos")
+
+    if formato == "json":
+        out = io.BytesIO(_json.dumps(resultados, indent=2, ensure_ascii=False).encode("utf-8"))
+        return StreamingResponse(out, media_type="application/json",
+                                 headers={"Content-Disposition": "attachment; filename=citas.json"})
+
+    elif formato == "csv":
+        out = io.StringIO()
+        w = _csv.writer(out)
+        w.writerow(["Paciente ID", "Original", "Traduccion", "Optimizado", "Idioma",
+                     "Tokens Orig", "Tokens Trad", "Tokens Opt", "Ahorro", "% Reduccion",
+                     "Costo Orig", "Costo Opt"])
+        for r in resultados:
+            w.writerow([r.get("paciente_id", ""), r.get("original", ""),
+                         r.get("traduccion", ""), r.get("texto_optimizado", ""),
+                         r.get("idioma", ""),
+                         r.get("tokens_original", 0), r.get("tokens_traduccion", 0),
+                         r.get("tokens_optimizado", 0), r.get("tokens_ahorrados", 0),
+                         r.get("porcentaje_reduccion", 0),
+                         r.get("costo_original", 0), r.get("costo_optimizado", 0)])
+        out.seek(0)
+        bio = io.BytesIO(out.getvalue().encode("utf-8-sig"))
+        return StreamingResponse(bio, media_type="text/csv",
+                                 headers={"Content-Disposition": "attachment; filename=citas.csv"})
+
+    elif formato == "xlsx":
+        import openpyxl
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Optimizacion"
+        ws.append(["Paciente ID", "Original", "Traduccion", "Optimizado", "Idioma",
+                    "Tokens Orig", "Tokens Trad", "Tokens Opt", "Ahorro", "% Reduccion",
+                    "Costo Orig", "Costo Opt"])
+        for r in resultados:
+            ws.append([r.get("paciente_id", ""), r.get("original", ""),
+                        r.get("traduccion", ""), r.get("texto_optimizado", ""),
+                        r.get("idioma", ""),
+                        r.get("tokens_original", 0), r.get("tokens_traduccion", 0),
+                        r.get("tokens_optimizado", 0), r.get("tokens_ahorrados", 0),
+                        r.get("porcentaje_reduccion", 0),
+                        r.get("costo_original", 0), r.get("costo_optimizado", 0)])
+        out = io.BytesIO()
+        wb.save(out)
+        out.seek(0)
+        return StreamingResponse(out,
+                                 media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                 headers={"Content-Disposition": "attachment; filename=citas.xlsx"})
 
     raise HTTPException(400, "Formato no soportado")
 
