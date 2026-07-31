@@ -28,7 +28,6 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 # ── Configuración de rendimiento ──
 
-CHUNK_SIZE = 3000
 MAX_TRANSLATION_WORKERS = 5
 MAX_LLM_WORKERS = 4
 
@@ -266,18 +265,7 @@ async def process_reviews(
         raise HTTPException(400, "No se encontraron reseñas en los archivos.")
     t1 = time.perf_counter()
 
-    # ── Procesamiento por chunks ──
-    todos_resultados = []
-    total_chunks = (len(todas_resenas) + CHUNK_SIZE - 1) // CHUNK_SIZE
-    for ci in range(0, len(todas_resenas), CHUNK_SIZE):
-        chunk = todas_resenas[ci:ci + CHUNK_SIZE]
-        chunk_resultados = _procesar_resenas(chunk, optimizar, rapido)
-        todos_resultados.extend(chunk_resultados)
-        if total_chunks > 1:
-            print(f"  [Reviews] Chunk {ci // CHUNK_SIZE + 1}/{total_chunks}: "
-                  f"{len(chunk)} reseñas")
-
-    resultados = todos_resultados
+    resultados = _procesar_resenas(todas_resenas, optimizar, rapido)
     total_es = sum(r["tokens_es"] for r in resultados)
     total_en = sum(r["tokens_en"] for r in resultados)
     t2 = time.perf_counter()
@@ -347,11 +335,7 @@ async def process_reviews_folder(
     if not todas_resenas:
         raise HTTPException(400, "No se encontraron reseñas en la carpeta.")
 
-    todos_resultados = []
-    for ci in range(0, len(todas_resenas), CHUNK_SIZE):
-        chunk = todas_resenas[ci:ci + CHUNK_SIZE]
-        todos_resultados.extend(_procesar_resenas(chunk, optimizar, rapido))
-    resultados = todos_resultados
+    resultados = _procesar_resenas(todas_resenas, optimizar, rapido)
     total_es = sum(r["tokens_es"] for r in resultados)
     total_en = sum(r["tokens_en"] for r in resultados)
 
@@ -719,17 +703,7 @@ async def analyze_citas(
         raise HTTPException(400, "No se encontraron citas médicas en los archivos.")
 
     t1 = _time.time()
-    todos_resultados = []
-    total_chunks = (len(todas_citas) + CHUNK_SIZE - 1) // CHUNK_SIZE
-    for ci in range(0, len(todas_citas), CHUNK_SIZE):
-        chunk = todas_citas[ci:ci + CHUNK_SIZE]
-        chunk_resultados = _procesar_citas_batch(chunk, optimizar_tokens)
-        todos_resultados.extend(chunk_resultados)
-        if total_chunks > 1:
-            print(f"  [Citas] Chunk {ci // CHUNK_SIZE + 1}/{total_chunks}: "
-                  f"{len(chunk)} mensajes")
-
-    resultados = todos_resultados
+    resultados = _procesar_citas_batch(todas_citas, optimizar_tokens)
     t2 = _time.time()
     stats = _calcular_stats_citas(resultados)
     t3 = _time.time()
@@ -773,11 +747,7 @@ async def analyze_citas_folder(
         raise HTTPException(400, "No se encontraron citas médicas en la carpeta.")
 
     t1 = _time.time()
-    todos_resultados = []
-    for ci in range(0, len(todas_citas), CHUNK_SIZE):
-        chunk = todas_citas[ci:ci + CHUNK_SIZE]
-        todos_resultados.extend(_procesar_citas_batch(chunk, optimizar_tokens))
-    resultados = todos_resultados
+    resultados = _procesar_citas_batch(todas_citas, optimizar_tokens)
     t2 = _time.time()
     stats = _calcular_stats_citas(resultados)
     t3 = _time.time()
