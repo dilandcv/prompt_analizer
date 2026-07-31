@@ -5,7 +5,7 @@ from faker import Faker
 
 
 def generar_citas_excel(
-    nombre_archivo="citas_medicas_solicitudes.xlsx", num_filas=1
+    nombre_archivo="citas_medicas_solicitudes.xlsx", num_filas=10000
 ):
     print(f"Generando {num_filas} solicitudes de citas médicas en español...")
 

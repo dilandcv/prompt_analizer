@@ -14,6 +14,7 @@ from backend.token_counter import (
     leer_excel_resenas, leer_csv_resenas, extraer_texto_archivo,
     leer_carpeta_excel,
     clasificar_resenas_qwen, calcular_costo, contar_tokens_texto,
+    _clasificacion_fallback,
     analizar_prompt_rubrica,
     leer_excel_citas_medicas, leer_carpeta_excel_citas,
     extraer_esquema_medico, _traducir_lote,
@@ -28,10 +29,15 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 @app.post("/api/analyze")
 async def analyze_prompt(texto: str = Form("")):
+    import time
+    t_total = time.perf_counter()
+
     texto = texto.strip()
     if not texto:
         raise HTTPException(400, "Texto vacío")
 
+    # ── Detección + traducción ──
+    t0 = time.perf_counter()
     idioma = detectar_idioma(texto)
     try:
         if idioma == "es":
@@ -46,19 +52,32 @@ async def analyze_prompt(texto: str = Form("")):
         traduccion = ""
         tokens_orig = contar_tokens(texto)
         tokens_trad = 0
+    t1 = time.perf_counter()
 
+    # ── Evaluación de calidad ──
     try:
         prompt = analizar_prompt(texto)
     except Exception:
         prompt = {"puntaje": 0, "nivel": "error", "detalles": [],
                   "fortalezas": [], "debilidades": [], "recomendaciones": [],
                   "puntaje_ia": 0, "puntaje_heuristico": 0, "evaluacion_ia": False}
+    t2 = time.perf_counter()
+
+    # ── Mejora + recomendación ──
     optimo = prompt["puntaje"] >= 80
     try:
         mejora = None if optimo else generar_ejemplo_mejora(texto)
     except Exception:
         mejora = None
     modelo = recomendar_modelo(texto, prompt)
+    t3 = time.perf_counter()
+
+    print(f"""
+[Prompt] idioma={idioma} tokens={tokens_orig}/{tokens_trad} puntaje={prompt['puntaje']} nivel={prompt['nivel']}
+  Traduccion....{t1 - t0:.2f}s
+  Evaluacion....{t2 - t1:.2f}s  (IA={prompt.get('evaluacion_ia', False)})
+  Mejora........{t3 - t2:.2f}s
+  TOTAL.........{t3 - t_total:.2f}s""")
 
     return {
         "original": texto,
@@ -92,21 +111,68 @@ async def analyze_rubric(texto: str = Form("")):
 # ── Excel / File Reviews ──
 
 def _procesar_resenas(todas_resenas: list, optimizar: bool, rapido: bool = False) -> list:
+    """Procesa reseñas con agrupacion por sentimiento|categoria.
+
+    1. Clasifica localmente cada reseña (sentimiento, categoria).
+    2. Agrupa por clave compuesta (sentimiento|categoria).
+    3. Traduce cada grupo en lote (una llamada Google Translate por grupo).
+    4. Cuenta tokens de las traducciones.
+    """
+    import itertools, concurrent.futures
+
+    # ── Fase 1: Conteo de tokens + clasificacion local ──
     resultados = []
     for texto in todas_resenas:
         tokens_es = contar_tokens_texto(texto)
-        tokens_en = tokens_es
-        traduccion = ""
-        if optimizar:
-            try:
-                traduccion = traducir(texto, "es", "en")
-                tokens_en = contar_tokens_texto(traduccion)
-            except Exception:
-                tokens_en = tokens_es
+        clasif = _clasificacion_fallback(texto)
+        clave = f"{clasif['sentimiento']}|{clasif['category']}"
         resultados.append({
-            "original": texto, "traduccion": traduccion,
-            "tokens_es": tokens_es, "tokens_en": tokens_en,
+            "original": texto,
+            "traduccion": "",
+            "tokens_es": tokens_es,
+            "tokens_en": tokens_es,
+            "_clave": clave,
         })
+
+    if not optimizar:
+        for r in resultados:
+            r.pop("_clave", None)
+        return resultados
+
+    # ── Fase 2: Agrupamiento ──
+    resultados.sort(key=lambda r: r["_clave"])
+    grupos = {k: list(g) for k, g in itertools.groupby(resultados, key=lambda r: r["_clave"])}
+
+    # ── Fase 3: Traduccion por grupo (concurrente) ──
+    grupos_lista = list(grupos.items())
+    max_workers = min(len(grupos_lista), 5)
+
+    def _traducir_grupo(item):
+        clave, grupo = item
+        textos = [r["original"] for r in grupo]
+        traducciones = _traducir_lote(textos, "es")
+        for j, r in enumerate(grupo):
+            if j < len(traducciones) and traducciones[j]:
+                r["traduccion"] = traducciones[j]
+                r["tokens_en"] = contar_tokens_texto(traducciones[j])
+        return clave, len(grupo)
+
+    completados = 0
+    total_grupos = len(grupos_lista)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futuros = {ex.submit(_traducir_grupo, g): g for g in grupos_lista}
+        for futuro in concurrent.futures.as_completed(futuros):
+            clave, tam = futuro.result()
+            completados += 1
+            print(f"  [Reviews] Traducido {completados}/{total_grupos} "
+                  f"'{clave}': {tam} reseñas")
+
+    print(f"  [Reviews] Agrupacion: {total_grupos} grupos desde "
+          f"{len(todas_resenas)} reseñas")
+
+    for r in resultados:
+        r.pop("_clave", None)
+
     return resultados
 
 
@@ -403,7 +469,7 @@ def _procesar_mensaje_cita(texto: str, optimizar: bool) -> dict:
     tokens_trad = contar_tokens_texto(traduccion)
 
     # ── Optimizar ──
-    texto_opt = optimizar_texto(traduccion, idioma_opt)
+    texto_opt = _optimizar_con_llm(traduccion, idioma_opt)
     if not texto_opt or not texto_opt.strip():
         print(f"  [DEBUG] Optimizacion vacia, usando traduccion literal")
         texto_opt = traduccion
@@ -540,6 +606,7 @@ def _procesar_citas_batch(citas: list, optimizar: bool) -> list:
     for m in mensajes:
         m.pop("_clave", None)
         m.pop("_idioma_orig", None)
+        m.pop("_trad", None)
 
     # ── Perfilado ──
     if optimizar:

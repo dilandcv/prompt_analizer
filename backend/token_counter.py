@@ -1,8 +1,11 @@
 import re
+import socket
 import tiktoken
 from deep_translator import GoogleTranslator
 
 import json
+
+socket.setdefaulttimeout(15)
 
 try:
     import ollama
@@ -1457,3 +1460,57 @@ def _calcular_ahorro(tokens_original: int, tokens_optimizado: int) -> dict:
     ahorro = max(0, tokens_original - tokens_optimizado)
     pct = round(ahorro / tokens_original * 100, 1) if tokens_original > 0 else 0.0
     return {"ahorro": ahorro, "pct_reduccion": pct}
+
+
+# ═══════════════════════════════════════════
+#  Optimizacion con LLM para Caso 3
+# ═══════════════════════════════════════════
+
+OLLAMA_OPT_MODEL = "llama3:8b"
+
+
+def _optimizar_con_llm(texto: str, idioma_destino: str) -> str:
+    """Optimiza un texto usando Ollama para reducir tokens al maximo.
+
+    Envia el texto traducido al LLM con instrucciones de reescritura concisa
+    preservando significado, datos medicos, nombres y fechas.
+    Si Ollama no esta disponible o falla, usa optimizacion heuristica.
+
+    Args:
+        texto: texto ya traducido al idioma destino.
+        idioma_destino: "en" o "es".
+
+    Returns:
+        texto optimizado con menos tokens.
+    """
+    if not texto or not texto.strip():
+        return texto
+
+    if _ollama_client is None:
+        return optimizar_texto(texto, idioma_destino)
+
+    prompt = (
+        "Rewrite the following text to use the MINIMUM possible number of tokens "
+        "while PRESERVING: meaning, intent, action requested, medical specialty, "
+        "patient data, dates, times, names, and any specific details.\n\n"
+        "RULES:\n"
+        "- Remove filler words, courtesy phrases, and redundancies.\n"
+        "- Use the shortest possible construction.\n"
+        "- Do NOT invent, add, or remove any factual information.\n"
+        "- Respond ONLY with the optimized text. No explanations, no notes.\n\n"
+        f'Text to optimize:\n"""{texto}"""\n\n'
+        "Optimized version:"
+    )
+    try:
+        respuesta = _ollama_generate(
+            prompt,
+            model=OLLAMA_OPT_MODEL,
+            max_tokens=300,
+            temperature=0.1,
+        )
+        if respuesta and len(respuesta.strip()) > 3:
+            return respuesta.strip()
+    except Exception as e:
+        print(f"  [LLM Optimizer] Ollama fallo: {e}, usando heuristica")
+
+    return optimizar_texto(texto, idioma_destino)

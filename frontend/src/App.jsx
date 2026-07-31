@@ -256,8 +256,12 @@ function ReviewsTab() {
     }).then((r) => r.blob()).then((b) => {
       const url = URL.createObjectURL(b);
       const a = document.createElement("a");
-      a.href = url; a.download = `reviews.${fmt === "xlsx" ? "xlsx" : fmt}`;
-      a.click(); URL.revokeObjectURL(url);
+      a.href = url;
+      a.download = `reviews.${fmt === "xlsx" ? "xlsx" : fmt}`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
     });
   }
 
@@ -450,8 +454,12 @@ function CitasTab() {
     }).then((r) => r.blob()).then((b) => {
       const url = URL.createObjectURL(b);
       const a = document.createElement("a");
-      a.href = url; a.download = `citas.${fmt === "xlsx" ? "xlsx" : fmt}`;
-      a.click(); URL.revokeObjectURL(url);
+      a.href = url;
+      a.download = `citas.${fmt === "xlsx" ? "xlsx" : fmt}`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
     });
   }
 
