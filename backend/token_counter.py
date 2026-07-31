@@ -1346,55 +1346,101 @@ def extraer_esquema_medico(mensaje: str) -> dict:
 _SEP = "\n|||SEP|||\n"
 _MAX_CHARS_LOTE = 4500
 
+_cache_traducciones = {}
+_cache_estadisticas = {"textos_originales": 0, "textos_unicos": 0, "peticiones_google": 0}
+
+
+def _limpiar_cache_traducciones():
+    """Reinicia metricas entre archivos (no borra la cache)."""
+    _cache_estadisticas["textos_originales"] = 0
+    _cache_estadisticas["textos_unicos"] = 0
+    _cache_estadisticas["peticiones_google"] = 0
+
+
+def _obtener_metricas_cache() -> dict:
+    """Retorna metricas de la cache de traducciones."""
+    return dict(_cache_estadisticas)
+
 
 def _traducir_lote(textos: list, idioma_origen: str) -> list:
-    """Traduce un lote de textos concatenandolos y dividiendo la respuesta.
+    """Traduce un lote de textos con deduplicacion para evitar trabajo repetido.
 
-    Agrupa textos con un separador unico, los traduce en una sola llamada
-    a Google Translate y luego separa el resultado. Si la validacion falla
-    (las partes no coinciden con los textos originales), hace fallback a
-    traduccion individual.
-
-    Args:
-        textos: lista de textos en el idioma origen.
-        idioma_origen: "es" o "en".
-
-    Returns:
-        lista de traducciones en el mismo orden.
+    Si el mismo texto aparece varias veces, solo se traduce una vez.
+    El resultado se reconstruye en el orden original.
+    Usa cache en memoria + persistente en disco.
     """
     if not textos:
         return []
 
+    _cache_estadisticas["textos_originales"] += len(textos)
     destino = "en" if idioma_origen == "es" else "es"
-    total_chars = sum(len(t) for t in textos) + len(_SEP) * (len(textos) - 1)
 
-    # Si el lote es muy grande, dividir recursivamente
-    if total_chars > _MAX_CHARS_LOTE and len(textos) > 1:
-        mitad = len(textos) // 2
-        izq = _traducir_lote(textos[:mitad], idioma_origen)
-        der = _traducir_lote(textos[mitad:], idioma_origen)
-        return izq + der
+    # Deduplicar: traducir solo textos unicos
+    unicos = []
+    mapa = {}
+    for i, t in enumerate(textos):
+        if t not in mapa:
+            mapa[t] = []
+        mapa[t].append(i)
+        if len(mapa[t]) == 1:
+            unicos.append(t)
 
-    if len(textos) == 1:
-        try:
-            return [traducir(textos[0], idioma_origen, destino)]
-        except Exception:
-            return [""]
+    _cache_estadisticas["textos_unicos"] += len(unicos)
+    total_chars = sum(len(t) for t in unicos) + len(_SEP) * (len(unicos) - 1)
 
-    texto_concatenado = _SEP.join(textos)
+    if total_chars > _MAX_CHARS_LOTE and len(unicos) > 1:
+        mitad = len(unicos) // 2
+        trad_izq = _traducir_lote(unicos[:mitad], idioma_origen)
+        trad_der = _traducir_lote(unicos[mitad:], idioma_origen)
+        traducciones_unicas = trad_izq + trad_der
+    elif len(unicos) == 1:
+        if unicos[0] in _cache_traducciones:
+            traducciones_unicas = [_cache_traducciones[unicos[0]]]
+        else:
+            try:
+                _cache_estadisticas["peticiones_google"] += 1
+                trad = traducir(unicos[0], idioma_origen, destino)
+                _cache_traducciones[unicos[0]] = trad
+                traducciones_unicas = [trad]
+            except Exception:
+                traducciones_unicas = [""]
+    else:
+        pendientes = []
+        indices_pendientes = []
+        traducciones_unicas = [""] * len(unicos)
+        for i, t in enumerate(unicos):
+            if t in _cache_traducciones:
+                traducciones_unicas[i] = _cache_traducciones[t]
+            else:
+                pendientes.append(t)
+                indices_pendientes.append(i)
 
-    try:
-        traduccion = traducir(texto_concatenado, idioma_origen, destino)
-    except Exception:
-        return [""] * len(textos)
+        if pendientes:
+            _cache_estadisticas["peticiones_google"] += 1
+            texto_concatenado = _SEP.join(pendientes)
+            try:
+                traduccion = traducir(texto_concatenado, idioma_origen, destino)
+                partes = traduccion.split(_SEP)
+                partes_limpias = [p.strip() for p in partes]
+                if len(partes_limpias) == len(pendientes):
+                    for j, idx in enumerate(indices_pendientes):
+                        traducciones_unicas[idx] = partes_limpias[j]
+                        _cache_traducciones[pendientes[j]] = partes_limpias[j]
+                else:
+                    for j, idx in enumerate(indices_pendientes):
+                        trad = _traducir_lote([pendientes[j]], idioma_origen)[0]
+                        traducciones_unicas[idx] = trad
+            except Exception:
+                for j, idx in enumerate(indices_pendientes):
+                    traducciones_unicas[idx] = ""
 
-    partes = traduccion.split(_SEP)
-    partes_limpias = [p.strip() for p in partes]
+    # Reconstruir resultado en orden original
+    resultado = [""] * len(textos)
+    for i, t in enumerate(unicos):
+        for pos in mapa[t]:
+            resultado[pos] = traducciones_unicas[i]
 
-    if len(partes_limpias) != len(textos):
-        return [_traducir_lote([t], idioma_origen)[0] for t in textos]
-
-    return partes_limpias
+    return resultado
 
 
 # ═══════════════════════════════════════════

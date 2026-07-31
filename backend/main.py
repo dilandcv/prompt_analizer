@@ -17,13 +17,20 @@ from backend.token_counter import (
     _clasificacion_fallback,
     analizar_prompt_rubrica,
     leer_excel_citas_medicas, leer_carpeta_excel_citas,
-    extraer_esquema_medico, _traducir_lote,
+    extraer_esquema_medico, _traducir_lote, _limpiar_cache_traducciones,
+    _obtener_metricas_cache,
     optimizar_texto, _calcular_ahorro,
     _RESENAS_POR_DIA, _DIAS_POR_MES,
 )
 
 app = FastAPI(title="Token Analyzer API", version="2.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+# ── Configuración de rendimiento ──
+
+CHUNK_SIZE = 3000
+MAX_TRANSLATION_WORKERS = 5
+MAX_LLM_WORKERS = 4
 
 # ── Prompt Analysis ──
 
@@ -145,7 +152,7 @@ def _procesar_resenas(todas_resenas: list, optimizar: bool, rapido: bool = False
 
     # ── Fase 3: Traduccion por grupo (concurrente) ──
     grupos_lista = list(grupos.items())
-    max_workers = min(len(grupos_lista), 5)
+    max_workers = min(len(grupos_lista), MAX_TRANSLATION_WORKERS)
 
     def _traducir_grupo(item):
         clave, grupo = item
@@ -217,6 +224,7 @@ async def process_reviews(
 ):
     import time
     t_total = time.perf_counter()
+    _limpiar_cache_traducciones()
 
     # ── Lectura de archivos ──
     t0 = time.perf_counter()
@@ -258,8 +266,18 @@ async def process_reviews(
         raise HTTPException(400, "No se encontraron reseñas en los archivos.")
     t1 = time.perf_counter()
 
-    # ── Procesamiento (tokens + traduccion) ──
-    resultados = _procesar_resenas(todas_resenas, optimizar, rapido)
+    # ── Procesamiento por chunks ──
+    todos_resultados = []
+    total_chunks = (len(todas_resenas) + CHUNK_SIZE - 1) // CHUNK_SIZE
+    for ci in range(0, len(todas_resenas), CHUNK_SIZE):
+        chunk = todas_resenas[ci:ci + CHUNK_SIZE]
+        chunk_resultados = _procesar_resenas(chunk, optimizar, rapido)
+        todos_resultados.extend(chunk_resultados)
+        if total_chunks > 1:
+            print(f"  [Reviews] Chunk {ci // CHUNK_SIZE + 1}/{total_chunks}: "
+                  f"{len(chunk)} reseñas")
+
+    resultados = todos_resultados
     total_es = sum(r["tokens_es"] for r in resultados)
     total_en = sum(r["tokens_en"] for r in resultados)
     t2 = time.perf_counter()
@@ -283,6 +301,7 @@ async def process_reviews(
         f"{c.get('error_type','')}|{c.get('category','')}|{c.get('sentimiento','')}"
         for c in clasificaciones
     ))
+    mt = _obtener_metricas_cache()
     print(f"""
 ========== PERFIL DE EJECUCION ==========
   Lectura Excel........{t1 - t0:.2f}s  ({n} reseñas)
@@ -290,6 +309,11 @@ async def process_reviews(
   Clasificacion........{t3 - t2:.2f}s  ({n_grupos} grupos detectados)
   Stats................{t4 - t3:.3f}s
   TOTAL................{t4 - t_total:.2f}s
+-----------------------------------------
+  Textos totales.......{mt.get('textos_originales', 0)}
+  Textos unicos........{mt.get('textos_unicos', 0)}
+  Peticiones Google....{mt.get('peticiones_google', 0)}
+  Reduccion............{n - mt.get('peticiones_google', 0)} llamadas
 =========================================""")
 
     return {
@@ -309,6 +333,7 @@ async def process_reviews_folder(
     optimizar: bool = Form(False),
     rapido: bool = Form(False),
 ):
+    _limpiar_cache_traducciones()
     if not carpeta.strip():
         raise HTTPException(400, "Debe especificar una ruta de carpeta.")
 
@@ -322,7 +347,11 @@ async def process_reviews_folder(
     if not todas_resenas:
         raise HTTPException(400, "No se encontraron reseñas en la carpeta.")
 
-    resultados = _procesar_resenas(todas_resenas, optimizar, rapido)
+    todos_resultados = []
+    for ci in range(0, len(todas_resenas), CHUNK_SIZE):
+        chunk = todas_resenas[ci:ci + CHUNK_SIZE]
+        todos_resultados.extend(_procesar_resenas(chunk, optimizar, rapido))
+    resultados = todos_resultados
     total_es = sum(r["tokens_es"] for r in resultados)
     total_en = sum(r["tokens_en"] for r in resultados)
 
@@ -548,7 +577,7 @@ def _procesar_citas_batch(citas: list, optimizar: bool) -> list:
     errores = 0
     if optimizar and grupos:
         grupos_lista = list(grupos.items())
-        max_workers = min(len(grupos_lista), 5)
+        max_workers = min(len(grupos_lista), MAX_TRANSLATION_WORKERS)
         completados = [0]
         total_grupos = len(grupos_lista)
 
@@ -662,6 +691,7 @@ async def analyze_citas(
     Columnas esperadas: paciente_id, mensaje_texto.
     Si optimizar_tokens=True, traduce cada mensaje y compara tokens ES vs EN.
     """
+    _limpiar_cache_traducciones()
     t0 = _time.time()
     todas_citas = []
     columnas_globales = set()
@@ -689,13 +719,26 @@ async def analyze_citas(
         raise HTTPException(400, "No se encontraron citas médicas en los archivos.")
 
     t1 = _time.time()
-    resultados = _procesar_citas_batch(todas_citas, optimizar_tokens)
+    todos_resultados = []
+    total_chunks = (len(todas_citas) + CHUNK_SIZE - 1) // CHUNK_SIZE
+    for ci in range(0, len(todas_citas), CHUNK_SIZE):
+        chunk = todas_citas[ci:ci + CHUNK_SIZE]
+        chunk_resultados = _procesar_citas_batch(chunk, optimizar_tokens)
+        todos_resultados.extend(chunk_resultados)
+        if total_chunks > 1:
+            print(f"  [Citas] Chunk {ci // CHUNK_SIZE + 1}/{total_chunks}: "
+                  f"{len(chunk)} mensajes")
+
+    resultados = todos_resultados
     t2 = _time.time()
     stats = _calcular_stats_citas(resultados)
     t3 = _time.time()
 
     n = len(todas_citas)
+    mt = _obtener_metricas_cache()
     print(f"[Citas] {n} mensajes | lectura={t1 - t0:.2f}s | procesamiento={t2 - t1:.2f}s | stats={t3 - t2:.3f}s | total={t3 - t0:.2f}s")
+    print(f"  Textos: {mt.get('textos_originales', 0)} total, {mt.get('textos_unicos', 0)} unicos, "
+          f"{mt.get('peticiones_google', 0)} peticiones Google")
 
     return {
         "resultados": resultados,
@@ -714,6 +757,7 @@ async def analyze_citas_folder(
 
     Recorre automaticamente todos los *.xlsx de la carpeta.
     """
+    _limpiar_cache_traducciones()
     if not carpeta.strip():
         raise HTTPException(400, "Debe especificar una ruta de carpeta.")
 
@@ -729,7 +773,11 @@ async def analyze_citas_folder(
         raise HTTPException(400, "No se encontraron citas médicas en la carpeta.")
 
     t1 = _time.time()
-    resultados = _procesar_citas_batch(todas_citas, optimizar_tokens)
+    todos_resultados = []
+    for ci in range(0, len(todas_citas), CHUNK_SIZE):
+        chunk = todas_citas[ci:ci + CHUNK_SIZE]
+        todos_resultados.extend(_procesar_citas_batch(chunk, optimizar_tokens))
+    resultados = todos_resultados
     t2 = _time.time()
     stats = _calcular_stats_citas(resultados)
     t3 = _time.time()
