@@ -28,8 +28,8 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 # ── Configuración de rendimiento ──
 
-MAX_TRANSLATION_WORKERS = 5
-MAX_LLM_WORKERS = 4
+MAX_TRANSLATION_WORKERS = 10
+MAX_LLM_WORKERS = 6
 
 # ── Prompt Analysis ──
 
@@ -128,9 +128,11 @@ def _procesar_resenas(todas_resenas: list, optimizar: bool, rapido: bool = False
 
     # ── Fase 1: Conteo de tokens + clasificacion local ──
     resultados = []
+    clasif_locales = []
     for texto in todas_resenas:
         tokens_es = contar_tokens_texto(texto)
         clasif = _clasificacion_fallback(texto)
+        clasif_locales.append(clasif)
         clave = f"{clasif['sentimiento']}|{clasif['category']}"
         resultados.append({
             "original": texto,
@@ -143,7 +145,7 @@ def _procesar_resenas(todas_resenas: list, optimizar: bool, rapido: bool = False
     if not optimizar:
         for r in resultados:
             r.pop("_clave", None)
-        return resultados
+        return resultados, clasif_locales
 
     # ── Fase 2: Agrupamiento ──
     resultados.sort(key=lambda r: r["_clave"])
@@ -179,7 +181,7 @@ def _procesar_resenas(todas_resenas: list, optimizar: bool, rapido: bool = False
     for r in resultados:
         r.pop("_clave", None)
 
-    return resultados
+    return resultados, clasif_locales
 
 
 def _calcular_stats(resultados: list, total_es: int, total_en: int) -> dict:
@@ -236,43 +238,48 @@ async def process_reviews(
         ext = archivo.filename.rsplit(".", 1)[-1].lower() if "." in archivo.filename else ""
         if ext not in ("xlsx", "csv", "pdf", "txt"):
             continue
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix="." + ext)
-        tmp.write(await archivo.read())
-        tmp.close()
-        try:
-            if ext == "xlsx":
-                resenas, headers = leer_excel_resenas(tmp.name, columna or None)
-                todas_resenas.extend(resenas)
-                columnas_globales.update(headers)
-            elif ext == "csv":
+
+        if ext == "xlsx":
+            data = io.BytesIO(await archivo.read())
+            resenas, headers = leer_excel_resenas(data, columna or None)
+            todas_resenas.extend(resenas)
+            columnas_globales.update(headers)
+        elif ext == "csv":
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix="." + ext)
+            tmp.write(await archivo.read())
+            tmp.close()
+            try:
                 resenas, headers = leer_csv_resenas(tmp.name, columna or None)
                 todas_resenas.extend(resenas)
                 columnas_globales.update(headers)
-            elif ext in ("pdf", "txt"):
+            finally:
+                _os.unlink(tmp.name)
+        elif ext in ("pdf", "txt"):
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix="." + ext)
+            tmp.write(await archivo.read())
+            tmp.close()
+            try:
                 texto = extraer_texto_archivo(tmp.name, archivo.filename)
                 if texto:
                     for linea in texto.split("\n"):
                         linea = linea.strip()
                         if linea and len(linea) > 5:
                             todas_resenas.append(linea)
-        finally:
-            try:
+            finally:
                 _os.unlink(tmp.name)
-            except OSError:
-                pass
 
     if not todas_resenas:
         raise HTTPException(400, "No se encontraron reseñas en los archivos.")
     t1 = time.perf_counter()
 
-    resultados = _procesar_resenas(todas_resenas, optimizar, rapido)
+    resultados, clasif_locales = _procesar_resenas(todas_resenas, optimizar, rapido)
     total_es = sum(r["tokens_es"] for r in resultados)
     total_en = sum(r["tokens_en"] for r in resultados)
     t2 = time.perf_counter()
 
     # ── Clasificacion ──
     textos_para_clasificar = [r["traduccion"] if (optimizar and r["traduccion"]) else r["original"] for r in resultados]
-    clasificaciones = clasificar_resenas_qwen(textos_para_clasificar, rapido=rapido)
+    clasificaciones = clasificar_resenas_qwen(textos_para_clasificar, clasif_locales=clasif_locales, rapido=rapido)
     for i, r in enumerate(resultados):
         if i < len(clasificaciones):
             r["clasificacion"] = clasificaciones[i]
@@ -300,8 +307,8 @@ async def process_reviews(
 -----------------------------------------
   Textos totales.......{mt.get('textos_originales', 0)}
   Textos unicos........{mt.get('textos_unicos', 0)}
-  Peticiones Google....{mt.get('peticiones_google', 0)}
-  Reduccion............{n - mt.get('peticiones_google', 0)} llamadas
+  Cache hits...........{mt.get('cache_hits', 0)}
+  MarianMT textos......{mt.get('marian_textos', 0)}
 =========================================""")
 
     return {
@@ -335,12 +342,12 @@ async def process_reviews_folder(
     if not todas_resenas:
         raise HTTPException(400, "No se encontraron reseñas en la carpeta.")
 
-    resultados = _procesar_resenas(todas_resenas, optimizar, rapido)
+    resultados, clasif_locales = _procesar_resenas(todas_resenas, optimizar, rapido)
     total_es = sum(r["tokens_es"] for r in resultados)
     total_en = sum(r["tokens_en"] for r in resultados)
 
     textos_para_clasificar = [r["traduccion"] if (optimizar and r["traduccion"]) else r["original"] for r in resultados]
-    clasificaciones = clasificar_resenas_qwen(textos_para_clasificar, rapido=rapido)
+    clasificaciones = clasificar_resenas_qwen(textos_para_clasificar, clasif_locales=clasif_locales, rapido=rapido)
     for i, r in enumerate(resultados):
         if i < len(clasificaciones):
             r["clasificacion"] = clasificaciones[i]
@@ -514,66 +521,97 @@ def _procesar_mensaje_cita(texto: str, optimizar: bool) -> dict:
 def _procesar_citas_batch(citas: list, optimizar: bool) -> list:
     """Pipeline de optimizacion con agrupacion inteligente.
 
-    Fase 1: extrae esquema medico y cuenta tokens (local).
-    Fase 2: agrupa por clave compuesta (accion|especialidad|idioma).
-    Fase 3: traduce cada grupo en lote.
-    Fase 4: optimiza cada texto y calcula ahorro.
+    Fase 1: agrupa textos identicos y extrae esquema + idioma solo una vez por texto unico.
+    Fase 2: cuenta tokens en paralelo (tiktoken libera el GIL).
+    Fase 3: agrupa por clave compuesta (accion|especialidad|idioma).
+    Fase 4: traduce cada grupo en lote + optimiza + calcula ahorro.
     """
     import time, itertools, concurrent.futures
 
     t_total = time.time()
 
-    # ── Fase 1: Schemas + conteo ──
+    # ── Fase 1: Agrupar textos identicos, extraer esquema una sola vez ──
     t0 = time.time()
-    mensajes = []
-    for cita in citas:
+    texto_a_indices = {}
+    for i, cita in enumerate(citas):
         texto = cita["mensaje_texto"]
-        tokens_es = contar_tokens_texto(texto)
-        idioma = detectar_idioma(texto)
-        esquema = extraer_esquema_medico(texto)
+        if texto not in texto_a_indices:
+            texto_a_indices[texto] = []
+        texto_a_indices[texto].append(i)
+
+    textos_unicos = list(texto_a_indices.keys())
+    total_unicos = len(textos_unicos)
+
+    # Extraer esquema + idioma solo para textos unicos
+    esquemas = {}
+    idiomas = {}
+    for texto in textos_unicos:
+        esquemas[texto] = extraer_esquema_medico(texto)
+        idiomas[texto] = detectar_idioma(texto)
+
+    # ── Fase 2: Contar tokens en paralelo ──
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        tokens_map = dict(zip(textos_unicos, ex.map(contar_tokens_texto, textos_unicos)))
+
+    # ── Fase 3: Agrupar por clave compuesta y construir resultados ──
+    mensajes = [None] * len(citas)
+    for texto, indices in texto_a_indices.items():
+        tokens_es = tokens_map[texto]
+        idioma = idiomas[texto]
+        esquema = esquemas[texto]
         clave = f"{esquema['accion']}|{esquema['especialidad']}|{idioma}"
         costo_orig = calcular_costo(tokens_es)
-        mensajes.append({
-            "paciente_id": cita.get("paciente_id", ""),
-            "original": texto,
-            "traduccion": "",
-            "texto_optimizado": texto,
-            "idioma": idioma,
-            "tokens_original": tokens_es,
-            "tokens_traduccion": tokens_es,
-            "tokens_optimizado": tokens_es,
-            "tokens_ahorrados": 0,
-            "porcentaje_reduccion": 0.0,
-            "costo_original": costo_orig,
-            "costo_optimizado": costo_orig,
-            "_clave": clave,
-            "_idioma_orig": idioma,
-        })
+
+        for idx in indices:
+            citas[idx]["_tokens_es"] = tokens_es
+            mensajes[idx] = {
+                "paciente_id": citas[idx].get("paciente_id", ""),
+                "original": texto,
+                "traduccion": "",
+                "texto_optimizado": texto,
+                "idioma": idioma,
+                "tokens_original": tokens_es,
+                "tokens_traduccion": tokens_es,
+                "tokens_optimizado": tokens_es,
+                "tokens_ahorrados": 0,
+                "porcentaje_reduccion": 0.0,
+                "costo_original": costo_orig,
+                "costo_optimizado": costo_orig,
+                "_clave": clave,
+                "_idioma_orig": idioma,
+            }
+
     t1 = time.time()
     total = len(mensajes)
 
-    # ── Fase 2: Agrupamiento ──
+    # ── Agrupamiento ──
     mensajes.sort(key=lambda m: m["_clave"])
     grupos = {k: list(g) for k, g in itertools.groupby(mensajes, key=lambda m: m["_clave"])}
     t2 = time.time()
 
-    # ── Fase 3+4: Traduccion + optimizacion por grupo ──
+    # ── Fase 4: Traduccion + optimizacion por grupo ──
     errores = 0
     if optimizar and grupos:
         grupos_lista = list(grupos.items())
-        max_workers = min(len(grupos_lista), MAX_TRANSLATION_WORKERS)
-        completados = [0]
         total_grupos = len(grupos_lista)
+        max_workers = min(len(grupos_lista), MAX_TRANSLATION_WORKERS)
+
+        # ── Fase 4a: Traduir TODOS los textos unicos en un solo batch ──
+        t_pre = time.time()
+        todos_unicos = list(texto_a_indices.keys())
+        todos_traducciones = _traducir_lote(todos_unicos, "es")
+        trad_map = dict(zip(todos_unicos, todos_traducciones))
+        t_post = time.time()
+
+        # ── Fase 4b: Aplicar traducciones + optimizar en paralelo ──
+        completados = [0]
 
         def _procesar_grupo(item):
             clave, grupo = item
-            textos = [m["original"] for m in grupo]
             idioma_orig = grupo[0]["_idioma_orig"]
-            traducciones = _traducir_lote(textos, idioma_orig)
-
             errs = 0
-            for j, m in enumerate(grupo):
-                trad = traducciones[j] if j < len(traducciones) and traducciones[j] else ""
+            for m in grupo:
+                trad = trad_map.get(m["original"], "")
                 if not trad:
                     errs += 1
                     continue
@@ -608,8 +646,9 @@ def _procesar_citas_batch(citas: list, optimizar: bool) -> list:
                 print(f"  [Citas] Grupo {completados[0]}/{total_grupos} '{clave}': "
                       f"{tam} mensajes" + (f" ({errs} errores)" if errs else ""))
 
+        print(f"  [Citas] Traduccion unificada: {t_post - t_pre:.2f}s ({total_unicos} textos unicos)")
         print(f"  [Citas] Agrupacion: {total_grupos} grupos desde {total} mensajes "
-              f"({total} traducciones -> {total_grupos} lotes)")
+              f"({total_unicos} textos unicos)")
     else:
         print(f"  [Citas] {total} mensajes procesados (sin optimizar)")
 
@@ -626,14 +665,17 @@ def _procesar_citas_batch(citas: list, optimizar: bool) -> list:
         ahorro_total = sum(m["tokens_ahorrados"] for m in mensajes)
         total_orig = sum(m["tokens_original"] for m in mensajes)
         pct = round(ahorro_total / total_orig * 100, 1) if total_orig else 0
+        mt = _obtener_metricas_cache()
         print(f"""
 ===== PERFIL DE OPTIMIZACION =====
-  Schemas + conteo......{t1 - t0:.2f}s  ({total} mensajes)
-  Agrupamiento..........{t2 - t1:.2f}s  ({len(grupos)} grupos)
-  Traduccion + optim....{t3 - t2:.2f}s  ({len(grupos)} lotes, {max_workers if optimizar and grupos else 0} workers, {errores} errores)
-  TOTAL.................{t3 - t_total:.2f}s
-  Ahorro global.........{ahorro_total} tokens ({pct}%)
-====================================""")
+  Agrupacion + schemas...{t1 - t0:.2f}s  ({total} mensajes, {total_unicos} unicos)
+  Agrupamiento............{t2 - t1:.2f}s  ({len(grupos)} grupos)
+  Traduccion (MarianMT)...{t3 - t2:.2f}s  ({total_unicos} textos, {mt.get('marian_textos', 0)} no cacheados)
+  TOTAL...................{t3 - t_total:.2f}s
+  Ahorro global...........{ahorro_total} tokens ({pct}%)
+  Cache hits..............{mt.get('cache_hits', 0)}
+  MarianMT textos.........x{mt.get('marian_textos', 0)}
+=====================================""")
     else:
         print(f"  [Citas] {total} mensajes procesados (sin optimizar)")
 
@@ -686,18 +728,10 @@ async def analyze_citas(
         ext = archivo.filename.rsplit(".", 1)[-1].lower() if "." in archivo.filename else ""
         if ext not in ("xlsx",):
             continue
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix="." + ext)
-        tmp.write(await archivo.read())
-        tmp.close()
-        try:
-            citas, headers = leer_excel_citas_medicas(tmp.name)
-            todas_citas.extend(citas)
-            columnas_globales.update(headers)
-        finally:
-            try:
-                _os.unlink(tmp.name)
-            except OSError:
-                pass
+        data = io.BytesIO(await archivo.read())
+        citas, headers = leer_excel_citas_medicas(data)
+        todas_citas.extend(citas)
+        columnas_globales.update(headers)
 
     if not todas_citas:
         raise HTTPException(400, "No se encontraron citas médicas en los archivos.")
@@ -712,7 +746,7 @@ async def analyze_citas(
     mt = _obtener_metricas_cache()
     print(f"[Citas] {n} mensajes | lectura={t1 - t0:.2f}s | procesamiento={t2 - t1:.2f}s | stats={t3 - t2:.3f}s | total={t3 - t0:.2f}s")
     print(f"  Textos: {mt.get('textos_originales', 0)} total, {mt.get('textos_unicos', 0)} unicos, "
-          f"{mt.get('peticiones_google', 0)} peticiones Google")
+          f"{mt.get('marian_textos', 0)} MarianMT, {mt.get('cache_hits', 0)} cache")
 
     return {
         "resultados": resultados,

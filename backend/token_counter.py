@@ -1,11 +1,230 @@
 import re
-import socket
 import tiktoken
-from deep_translator import GoogleTranslator
 
 import json
+import os
+import sqlite3
+import hashlib
+import time as _time_module
+import threading
+import warnings
+warnings.filterwarnings("ignore", message=".*max_new_tokens.*max_length.*")
 
-socket.setdefaulttimeout(15)
+try:
+    from transformers import MarianMTModel, MarianTokenizer
+    import torch
+    _TRANSFORMERS_OK = True
+except ImportError:
+    _TRANSFORMERS_OK = False
+
+# ── Regex compilados a nivel módulo ──
+_RE_PALABRAS = re.compile(r"[a-záéíóúüñ]+")
+_RE_ORACIONES = re.compile(r"[.!?]+")
+_RE_TILDE_ES = re.compile(r"[ñáéíóúü¿¡]")
+_RE_DIGITOS = re.compile(r"\d+")
+_RE_MAYUS = re.compile(r"[A-ZÁÉÍÓÚÜÑ]")
+_RE_PUNTUACION_FINAL = re.compile(r"¿?\?$")
+_RE_VERBOS_ACCION = re.compile(
+    r"\b(explica|describe|genera|crea|haz|escribe|traduce|analiza|compara|resume|lista|muestra|dame|quiero|necesito)\b",
+    re.IGNORECASE,
+)
+_RE_ESPECIFICIDAD = re.compile(
+    r"\b(como|ejemplo|específicamente|concreto|detalle|versión|tipo|clase|marca|modelo|año|día|mes)\b",
+    re.IGNORECASE,
+)
+_RE_CONTEXTO = re.compile(
+    r"\b(eres|act[uú]a|imagina|supon|como si|rol|eres un|actua como)\b", re.IGNORECASE
+)
+_RE_FORMATO = re.compile(
+    r"\b(secciones|pasos|lista|tabla|json|markdown|esquema|estructura)\b", re.IGNORECASE
+)
+_RE_CODIGO = re.compile(
+    r"\b(python|javascript|java|código|codigo|code|función|function|clase|class|def|"
+    r"import|print|var|const|let|html|css|sql|bash|script|api|backend|frontend|"
+    r"algoritmo|algorithm|debug|error|bug|compilar|compile|server|database|bd|"
+    r"datos|archivo|file|csv|json|xml|endpoint|ruta|route)\b", re.IGNORECASE,
+)
+_RE_CREATIVO = re.compile(
+    r"\b(escribe|cuento|poema|historia|story|poem|creative|creativo|escribir|write|"
+    r"novela|guion|artículo|article|blog|ensayo|essay|narrativa|narrative|imagina|"
+    r"imagine|inventa|invent|crea|create|diseña|design)\b", re.IGNORECASE,
+)
+_RE_ANALITICO = re.compile(
+    r"\b(analiza|analyz|compara|compare|explain|explica|qué es|what is|how|"
+    r"por qué|why|razón|reason|diferencia|difference|significa|meaning|"
+    r"definición|definition|resume|summar|conclusión|conclusion|interpreta|interpret)\b",
+    re.IGNORECASE,
+)
+_RE_ESPACIOS = re.compile(r"\s{2,}")
+_RE_ESPACIO_PUNTO = re.compile(r"\s+\.")
+_RE_ESPACIO_COMA = re.compile(r"\s+,")
+
+# Keywords como frozenset para lookup O(1)
+_KW_CRASH = frozenset(["cierra", "crash", "crashea", "congela", "reinicia"])
+_KW_PERFORMANCE = frozenset(["lento", "lenta", "tarda", "demora"])
+_KW_LOADING = frozenset(["no carga", "no abre", "pantalla blanca", "blanco"])
+_KW_BUG = frozenset(["error", "falla", "roto", "bug"])
+_KW_FEATURE_REQ = frozenset(["quisiera", "sería bueno", "me gustaría", "sugiero",
+                              "me encantaria", "me encantaría", "podrian", "podrían"])
+_KW_PHOTO = frozenset(["foto", "imagen", "perfil", "galeria", "cámara", "camara"])
+_KW_PAYMENT = frozenset(["pago", "compra", "tarjeta", "precio", "checkout",
+                          "dinero", "cobro", "factura", "gratis", "costar"])
+_KW_AUTH = frozenset(["login", "sesión", "sesion", "contraseña", "registro",
+                       "usuario", "autenticacion"])
+_KW_NOTIF = frozenset(["notificación", "notificacion", "aviso", "alerta",
+                        "mensaje", "email", "correo"])
+_KW_HIGH_SEV = frozenset(["siempre", "cada vez", "constante", "todo el tiempo",
+                           "inutilizable", "imposible", "no funciona", "nunca"])
+_KW_LOW_SEV = frozenset(["a veces", "ocasional", "raro", "de vez en cuando"])
+_KW_POSITIVO = frozenset(["excelente", "bueno", "buena", "genial", "increible", "increíble",
+                          "me encanta", "me gusta", "recomiendo", "perfecto", "perfecta",
+                          "maravilloso", "fantastico", "fantástico", "feliz", "contento",
+                          "gracias", "rapido", "rápido", "facil", "fácil", "util", "útil",
+                          "fluido", "estable", "bien", "mejor", "gran", "love", "great",
+                          "awesome", "amazing", "excellent", "wonderful", "best"])
+_KW_NEGATIVO = frozenset(["malo", "mala", "pesimo", "pésimo", "horrible", "terrible",
+                          "decepcion", "decepción", "no sirve", "basura", "odio", "detesto",
+                          "frustrante", "molesto", "lento", "problema", "defectuoso",
+                          "no funciona", "no me gusta", "pesima", "pésima", "malisimo",
+                          "malísimo", "pobre", "bad", "terrible", "worst", "awful",
+                          "hate", "useless", "horrible", "worst", "poor", "never"])
+
+# ═══════════════════════════════════════════
+#  Traductor local MarianMT + caché SQLite
+# ═══════════════════════════════════════════
+
+_MARIAN_ES_EN_MODEL = None
+_MARIAN_ES_EN_TOKENIZER = None
+_MARIAN_EN_ES_MODEL = None
+_MARIAN_EN_ES_TOKENIZER = None
+_MARIAN_DEVICE = None
+_MARIAN_BATCH_SIZE = 128
+_MAX_NEW_TOKENS = 128
+_CACHE_DB_PATH = None
+
+_MARIAN_LOCK = threading.Lock()
+_MARIAN_LOAD_TIME = 0.0
+
+
+def _init_marian():
+    global _MARIAN_ES_EN_MODEL, _MARIAN_ES_EN_TOKENIZER
+    global _MARIAN_EN_ES_MODEL, _MARIAN_EN_ES_TOKENIZER, _MARIAN_DEVICE
+    global _MARIAN_LOAD_TIME
+
+    if _MARIAN_ES_EN_MODEL is not None:
+        return
+    if not _TRANSFORMERS_OK:
+        raise RuntimeError("transformers/torch no instalados. Ejecuta: pip install torch transformers")
+
+    with _MARIAN_LOCK:
+        if _MARIAN_ES_EN_MODEL is not None:
+            return
+
+        t0 = _time_module.perf_counter()
+
+        _MARIAN_DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"  [MarianMT] Dispositivo: {_MARIAN_DEVICE}")
+
+        _MARIAN_ES_EN_TOKENIZER = MarianTokenizer.from_pretrained("Helsinki-NLP/opus-mt-es-en")
+        _MARIAN_ES_EN_MODEL = MarianMTModel.from_pretrained("Helsinki-NLP/opus-mt-es-en").to(_MARIAN_DEVICE)
+        _MARIAN_ES_EN_MODEL.eval()
+        _MARIAN_ES_EN_MODEL.generation_config.max_length = 256
+
+        _MARIAN_EN_ES_TOKENIZER = MarianTokenizer.from_pretrained("Helsinki-NLP/opus-mt-en-es")
+        _MARIAN_EN_ES_MODEL = MarianMTModel.from_pretrained("Helsinki-NLP/opus-mt-en-es").to(_MARIAN_DEVICE)
+        _MARIAN_EN_ES_MODEL.eval()
+        _MARIAN_EN_ES_MODEL.generation_config.max_length = 256
+
+        _MARIAN_LOAD_TIME = _time_module.perf_counter() - t0
+        print(f"  [MarianMT] Modelos cargados en {_MARIAN_LOAD_TIME:.1f}s")
+
+
+def _init_cache():
+    global _CACHE_DB_PATH
+    if _CACHE_DB_PATH is not None:
+        return
+    _CACHE_DB_PATH = os.path.join(os.path.dirname(__file__), "_cache_traducciones.db")
+
+
+def _get_db_conn():
+    _init_cache()
+    conn = sqlite3.connect(_CACHE_DB_PATH)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    return conn
+
+
+def _maybe_create_table(conn):
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS translations ("
+        "  source_lang TEXT NOT NULL,"
+        "  target_lang TEXT NOT NULL,"
+        "  original_text TEXT NOT NULL,"
+        "  translated_text TEXT NOT NULL,"
+        "  PRIMARY KEY (source_lang, target_lang, original_text)"
+        ")"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_lookup ON translations(source_lang, target_lang, original_text)"
+    )
+    conn.commit()
+
+
+def _cache_get(texto, origen, destino):
+    conn = _get_db_conn()
+    _maybe_create_table(conn)
+    try:
+        row = conn.execute(
+            "SELECT translated_text FROM translations WHERE source_lang=? AND target_lang=? AND original_text=?",
+            (origen, destino, texto),
+        ).fetchone()
+        result = row[0] if row else None
+        conn.close()
+        return result
+    except sqlite3.OperationalError:
+        conn.close()
+        return None
+
+
+def _cache_set(texto, origen, destino, traduccion):
+    conn = _get_db_conn()
+    _maybe_create_table(conn)
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO translations VALUES (?, ?, ?, ?)",
+            (origen, destino, texto, traduccion),
+        )
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+    finally:
+        conn.close()
+
+
+def _marian_translate(textos, origen, destino):
+    _init_marian()
+
+    if origen == "es" and destino == "en":
+        model = _MARIAN_ES_EN_MODEL
+        tokenizer = _MARIAN_ES_EN_TOKENIZER
+    else:
+        model = _MARIAN_EN_ES_MODEL
+        tokenizer = _MARIAN_EN_ES_TOKENIZER
+
+    resultados = []
+    bs = _MARIAN_BATCH_SIZE
+    for i in range(0, len(textos), bs):
+        batch = textos[i : i + bs]
+        with torch.inference_mode():
+            encoded = tokenizer(
+                batch, return_tensors="pt", padding=True,
+                truncation=True, max_length=256,
+            )
+            encoded = {k: v.to(_MARIAN_DEVICE) for k, v in encoded.items()}
+            generated = model.generate(**encoded, max_new_tokens=_MAX_NEW_TOKENS, num_beams=1)
+            decoded = tokenizer.batch_decode(generated, skip_special_tokens=True)
+            resultados.extend(decoded)
+    return resultados
 
 try:
     import ollama
@@ -226,34 +445,45 @@ PAL_EN = {"the", "and", "of", "to", "in", "is", "it", "you", "that", "was",
 
 def detectar_idioma(texto: str) -> str:
     texto_lower = texto.lower()
-    palabras = re.findall(r"[a-záéíóúüñ]+", texto_lower)
+    palabras = _RE_PALABRAS.findall(texto_lower)
     if not palabras:
         return "es"
-    if re.search(r"[ñáéíóúü¿¡]", texto_lower):
+    if _RE_TILDE_ES.search(texto_lower):
         return "es"
     cnt_es = sum(1 for p in palabras if p in PAL_ES)
     cnt_en = sum(1 for p in palabras if p in PAL_EN)
     return "es" if cnt_es > cnt_en else "en"
 
 
+_ENCODING_GPT4O = None
+_ENCODING_CL100K = None
+
+
+def _obtener_encoding_gpt4o():
+    global _ENCODING_GPT4O
+    if _ENCODING_GPT4O is None:
+        _ENCODING_GPT4O = tiktoken.encoding_for_model("gpt-4o")
+    return _ENCODING_GPT4O
+
+
+def _obtener_encoding_cl100k():
+    global _ENCODING_CL100K
+    if _ENCODING_CL100K is None:
+        _ENCODING_CL100K = tiktoken.get_encoding("cl100k_base")
+    return _ENCODING_CL100K
+
+
 def contar_tokens(texto: str) -> int:
-    encoding = tiktoken.encoding_for_model("gpt-4o")
-    tokens = encoding.encode(texto)
-    return len(tokens)
+    return len(_obtener_encoding_gpt4o().encode(texto))
 
 
 def traducir(texto: str, origen: str, destino: str) -> str:
-    try:
-        traductor = GoogleTranslator(source=origen, target=destino)
-        return traductor.translate(texto)
-    except Exception:
-        if _ollama_client is None:
-            raise
-        prompt = (
-            f"Translate the following text from {origen.upper()} to {destino.upper()}. "
-            f"Respond ONLY with the translation, no explanations:\n\n{texto}"
-        )
-        return _ollama_generate(prompt, max_tokens=200, temperature=0.1)
+    cached = _cache_get(texto, origen, destino)
+    if cached is not None:
+        return cached
+    resultado = _marian_translate([texto], origen, destino)[0]
+    _cache_set(texto, origen, destino, resultado)
+    return resultado
 
 
 def traducir_a_ingles(texto: str) -> str:
@@ -292,7 +522,7 @@ def analizar_prompt(texto: str) -> dict:
 
 def _calcular_puntaje(texto: str) -> int:
     palabras = texto.split()
-    oraciones = [o.strip() for o in re.split(r"[.!?]+", texto) if o.strip()]
+    oraciones = [o.strip() for o in _RE_ORACIONES.split(texto) if o.strip()]
     letras = len(texto)
     s = 0
     if letras >= 80:
@@ -301,14 +531,11 @@ def _calcular_puntaje(texto: str) -> int:
         s += 15
     else:
         s += 5
-    if re.search(r"\d+", texto):
+    if _RE_DIGITOS.search(texto):
         s += 15
-    if re.search(r"[A-ZÁÉÍÓÚÜÑ]", texto):
+    if _RE_MAYUS.search(texto):
         s += 10
-    if re.search(r"¿?\?$", texto.strip()) or re.search(
-        r"\b(explica|describe|genera|crea|haz|escribe|traduce|analiza|compara|resume|lista|muestra|dame|quiero|necesito)\b",
-        texto.lower(),
-    ):
+    if _RE_PUNTUACION_FINAL.search(texto.strip()) or _RE_VERBOS_ACCION.search(texto):
         s += 25
     if len(oraciones) >= 2:
         s += 10
@@ -319,7 +546,7 @@ def _calcular_puntaje(texto: str) -> int:
 
 def _analizar_detalles(texto: str) -> list:
     palabras = texto.split()
-    oraciones = [o.strip() for o in re.split(r"[.!?]+", texto) if o.strip()]
+    oraciones = [o.strip() for o in _RE_ORACIONES.split(texto) if o.strip()]
     letras = len(texto)
     d = []
 
@@ -333,9 +560,9 @@ def _analizar_detalles(texto: str) -> list:
         d.append(("Longitud", 5, "Muy corto. Agrega más contexto."))
 
     esp = sum([
-        bool(re.search(r"\d+", texto)),
-        bool(re.search(r"[A-ZÁÉÍÓÚÜÑ]", texto)),
-        bool(re.search(r"\b(como|ejemplo|específicamente|concreto|detalle|versión|tipo|clase|marca|modelo|año|día|mes)\b", texto.lower())),
+        bool(_RE_DIGITOS.search(texto)),
+        bool(_RE_MAYUS.search(texto)),
+        bool(_RE_ESPECIFICIDAD.search(texto.lower())),
     ])
     if esp >= 2:
         d.append(("Especificidad", 25, "Incluyes datos concretos y específicos."))
@@ -344,10 +571,7 @@ def _analizar_detalles(texto: str) -> list:
     else:
         d.append(("Especificidad", 5, "Muy genérico. Sé más concreto."))
 
-    if re.search(r"¿?\?$", texto.strip()) or re.search(
-        r"\b(explica|describe|genera|crea|haz|escribe|traduce|analiza|compara|resume|lista|muestra|dame|quiero|necesito)\b",
-        texto.lower(),
-    ):
+    if _RE_PUNTUACION_FINAL.search(texto.strip()) or _RE_VERBOS_ACCION.search(texto):
         d.append(("Claridad", 25, "Claro. Se entiende lo que pides."))
     else:
         d.append(("Claridad", 10, "Poco claro. Usa una pregunta o instrucción directa."))
@@ -376,20 +600,9 @@ def recomendar_modelo(texto: str, prompt_info: dict) -> dict:
     largo = len(texto)
     num_palabras = len(texto.split())
 
-    es_codigo = bool(re.search(
-        r"\b(python|javascript|java|código|codigo|code|función|function|clase|class|def|"
-        r"import|print|var|const|let|html|css|sql|bash|script|api|backend|frontend|"
-        r"algoritmo|algorithm|debug|error|bug|compilar|compile|server|database|bd|"
-        r"datos|archivo|file|csv|json|xml|endpoint|ruta|route)\b", baja))
-    es_creativo = bool(re.search(
-        r"\b(escribe|cuento|poema|historia|story|poem|creative|creativo|escribir|write|"
-        r"novela|guion|artículo|article|blog|ensayo|essay|narrativa|narrative|imagina|"
-        r"imagine|inventa|invent|crea|create|diseña|design)\b", baja))
-    es_analitico = bool(re.search(
-        r"\b(analiza|analyz|compara|compare|explain|explica|qué es|what is|how|"
-        r"por qué|why|razón|reason|diferencia|difference|significa|meaning|"
-        r"definición|definition|resume|summar|conclusión|conclusion|interpreta|interpret)\b",
-        baja))
+    es_codigo = bool(_RE_CODIGO.search(baja))
+    es_creativo = bool(_RE_CREATIVO.search(baja))
+    es_analitico = bool(_RE_ANALITICO.search(baja))
     es_largo = largo > 500 or num_palabras > 80
     es_simple = largo < 100 and num_palabras < 20
 
@@ -477,17 +690,10 @@ def _construir_mejora(texto: str) -> str:
     hacerlo mas efectivo. No depende de Ollama para ser instantaneo.
     """
 
-    tiene_pregunta = bool(re.search(r"\?$", texto.strip()))
-    tiene_verbo = bool(re.search(
-        r"\b(explica|describe|genera|crea|haz|escribe|traduce|analiza|compara|resume|lista)\b",
-        texto.lower(),
-    ))
-    ya_tiene_contexto = bool(re.search(
-        r"\b(eres|act[uú]a|imagina|supon|como si|rol|eres un|actua como)\b", texto.lower()
-    ))
-    ya_tiene_formato = bool(re.search(
-        r"\b(secciones|pasos|lista|tabla|json|markdown|esquema|estructura)\b", texto.lower()
-    ))
+    tiene_pregunta = bool(_RE_PUNTUACION_FINAL.search(texto.strip()))
+    tiene_verbo = bool(_RE_VERBOS_ACCION.search(texto))
+    ya_tiene_contexto = bool(_RE_CONTEXTO.search(texto.lower()))
+    ya_tiene_formato = bool(_RE_FORMATO.search(texto.lower()))
 
     partes = []
 
@@ -560,11 +766,11 @@ _RESENAS_POR_DIA = 10000
 _DIAS_POR_MES = 30
 
 
-def leer_excel_resenas(filepath: str, columna: str = None) -> tuple:
+def leer_excel_resenas(filepath_or_stream, columna: str = None) -> tuple:
     """Lee un archivo Excel y extrae reseñas de una columna.
 
     Args:
-        filepath: ruta al archivo .xlsx
+        filepath_or_stream: ruta al archivo .xlsx (str) o BytesIO stream.
         columna: nombre de columna a usar. Si es None, se auto-detecta.
 
     Returns:
@@ -572,7 +778,7 @@ def leer_excel_resenas(filepath: str, columna: str = None) -> tuple:
         columnas_disponibles es list[str] con los encabezados.
     """
     import openpyxl
-    wb = openpyxl.load_workbook(filepath, read_only=True)
+    wb = openpyxl.load_workbook(filepath_or_stream, read_only=True)
     ws = wb.active
     rows = list(ws.iter_rows(values_only=True))
     wb.close()
@@ -664,10 +870,11 @@ def calcular_costo(tokens: int, precio_por_millon: float = None) -> float:
     return round(tokens / 1_000_000 * precio, 4)
 
 
-def clasificar_resenas_qwen(resenas: list, chunk_size: int = 30, rapido: bool = False) -> list:
+def clasificar_resenas_qwen(resenas: list, chunk_size: int = 30, rapido: bool = False,
+                           clasif_locales: list = None) -> list:
     """Clasifica reseñas con estrategia hibrida: local + LLM bajo demanda.
 
-    1. Clasifica todo localmente (rapido).
+    1. Si clasif_locales no se proporciona, clasifica todo localmente (rapido).
     2. Agrupa por clave compuesta (error_type|category|sentimiento).
     3. Para grupos de baja confianza, llama al LLM una vez por grupo.
     4. Procesa grupos en paralelo con ThreadPoolExecutor.
@@ -675,8 +882,10 @@ def clasificar_resenas_qwen(resenas: list, chunk_size: int = 30, rapido: bool = 
     """
     import concurrent.futures, itertools
 
-    # ── Paso 1: Clasificacion local de todas las reseñas ──
-    locales = [_clasificacion_fallback(r) for r in resenas]
+    if clasif_locales is not None and len(clasif_locales) == len(resenas):
+        locales = clasif_locales
+    else:
+        locales = [_clasificacion_fallback(r) for r in resenas]
 
     if rapido or _ollama_client is None:
         return _limpiar_internos(locales)
@@ -794,59 +1003,42 @@ def _clasificacion_fallback(texto: str) -> dict:
     confianza = 0.0
 
     # ── Error type ──
-    if any(p in t for p in ["cierra", "crash", "crashea", "congela", "reinicia"]):
+    if any(p in t for p in _KW_CRASH):
         err = "crash"; confianza += 0.35
-    elif any(p in t for p in ["lento", "lenta", "tarda", "demora"]):
+    elif any(p in t for p in _KW_PERFORMANCE):
         err = "performance"; confianza += 0.35
-    elif any(p in t for p in ["no carga", "no abre", "pantalla blanca", "blanco"]):
+    elif any(p in t for p in _KW_LOADING):
         err = "loading_failure"; confianza += 0.35
-    elif any(p in t for p in ["error", "falla", "roto", "bug"]):
+    elif any(p in t for p in _KW_BUG):
         err = "bug"; confianza += 0.25
-    elif any(p in t for p in ["quisiera", "sería bueno", "me gustaría", "sugiero",
-                                "me encantaria", "me encantaría", "podrian", "podrían"]):
+    elif any(p in t for p in _KW_FEATURE_REQ):
         err = "feature_request"; confianza += 0.35
     else:
         err = "other"; confianza += 0.1
 
     # ── Component ──
-    if any(p in t for p in ["foto", "imagen", "perfil", "galeria", "cámara", "camara"]):
+    if any(p in t for p in _KW_PHOTO):
         comp = "profile_picture_upload"; confianza += 0.3
-    elif any(p in t for p in ["pago", "compra", "tarjeta", "precio", "checkout",
-                                "dinero", "cobro", "factura", "gratis", "costar"]):
+    elif any(p in t for p in _KW_PAYMENT):
         comp = "payment_flow"; confianza += 0.3
-    elif any(p in t for p in ["login", "sesión", "sesion", "contraseña", "registro",
-                                "usuario", "autenticacion"]):
+    elif any(p in t for p in _KW_AUTH):
         comp = "authentication"; confianza += 0.3
-    elif any(p in t for p in ["notificación", "notificacion", "aviso", "alerta",
-                                "mensaje", "email", "correo"]):
+    elif any(p in t for p in _KW_NOTIF):
         comp = "notifications"; confianza += 0.3
     else:
         comp = "general_ui"; confianza += 0.1
 
     # ── Severity ──
-    if any(p in t for p in ["siempre", "cada vez", "constante", "todo el tiempo",
-                             "inutilizable", "imposible", "no funciona", "nunca"]):
+    if any(p in t for p in _KW_HIGH_SEV):
         sev = "high"; confianza += 0.3
-    elif any(p in t for p in ["a veces", "ocasional", "raro", "de vez en cuando"]):
+    elif any(p in t for p in _KW_LOW_SEV):
         sev = "low"; confianza += 0.25
     else:
         sev = "medium"; confianza += 0.15
 
     # ── Sentimiento ──
-    positivo = ["excelente", "bueno", "buena", "genial", "increible", "increíble",
-                "me encanta", "me gusta", "recomiendo", "perfecto", "perfecta",
-                "maravilloso", "fantastico", "fantástico", "feliz", "contento",
-                "gracias", "rapido", "rápido", "facil", "fácil", "util", "útil",
-                "fluido", "estable", "bien", "mejor", "gran", "love", "great",
-                "awesome", "amazing", "excellent", "wonderful", "best"]
-    negativo = ["malo", "mala", "pesimo", "pésimo", "horrible", "terrible",
-                "decepcion", "decepción", "no sirve", "basura", "odio", "detesto",
-                "frustrante", "molesto", "lento", "problema", "defectuoso",
-                "no funciona", "no me gusta", "pesima", "pésima", "malisimo",
-                "malísimo", "pobre", "bad", "terrible", "worst", "awful",
-                "hate", "useless", "horrible", "worst", "poor", "never"]
-    cnt_pos = sum(1 for p in positivo if p in t)
-    cnt_neg = sum(1 for p in negativo if p in t)
+    cnt_pos = sum(1 for p in _KW_POSITIVO if p in t)
+    cnt_neg = sum(1 for p in _KW_NEGATIVO if p in t)
 
     if cnt_pos > cnt_neg:
         sentimiento = "positivo"; confianza += 0.05 * min(cnt_pos, 5)
@@ -857,17 +1049,17 @@ def _clasificacion_fallback(texto: str) -> dict:
 
     # ── Tópico ──
     topicos = {
-        "envio": ["envio", "envío", "entrega", "llegada", "paquete", "shipping",
-                  "delivery", "recibi", "recibí", "tardo", "tardó"],
-        "producto": ["producto", "calidad", "material", "diseño", "product",
-                     "tamaño", "color", "modelo", "peso"],
-        "atencion": ["atencion", "atención", "servicio", "soporte", "cliente",
-                     "ayuda", "respond", "service", "support", "staff"],
-        "precio": ["precio", "costar", "caro", "barato", "precios", "cuesta",
-                   "coste", "money", "price", "expensive", "cheap", "cobrar",
-                   "descuento", "oferta"],
-        "funcionalidad": ["funciona", "util", "útil", "practico", "práctico",
-                          "sirve", "feature", "funcionalidad", "uso", "usar"],
+        "envio": frozenset(["envio", "envío", "entrega", "llegada", "paquete", "shipping",
+                   "delivery", "recibi", "recibí", "tardo", "tardó"]),
+        "producto": frozenset(["producto", "calidad", "material", "diseño", "product",
+                      "tamaño", "color", "modelo", "peso"]),
+        "atencion": frozenset(["atencion", "atención", "servicio", "soporte", "cliente",
+                      "ayuda", "respond", "service", "support", "staff"]),
+        "precio": frozenset(["precio", "costar", "caro", "barato", "precios", "cuesta",
+                    "coste", "money", "price", "expensive", "cheap", "cobrar",
+                    "descuento", "oferta"]),
+        "funcionalidad": frozenset(["funciona", "util", "útil", "practico", "práctico",
+                           "sirve", "feature", "funcionalidad", "uso", "usar"]),
     }
     topico = "general"
     for nombre, keywords in topicos.items():
@@ -1048,7 +1240,7 @@ def analizar_prompt_rubrica(texto: str) -> dict:
     if not texto:
         return {"error": "El prompt no puede estar vacio."}
 
-    enc = tiktoken.get_encoding("cl100k_base")
+    enc = _obtener_encoding_cl100k()
 
     try:
         english_prompt = traducir(texto, "es", "en")
@@ -1131,12 +1323,12 @@ def _detectar_columna_mensaje(headers: list) -> str:
     return headers[1] if len(headers) > 1 else (headers[0] if headers else "")
 
 
-def leer_excel_citas_medicas(filepath: str, columna_id: str = None,
+def leer_excel_citas_medicas(filepath_or_stream, columna_id: str = None,
                              columna_mensaje: str = None) -> tuple:
     """Lee un Excel con datos de citas médicas.
 
     Args:
-        filepath: ruta al archivo .xlsx.
+        filepath_or_stream: ruta al archivo .xlsx (str) o BytesIO stream.
         columna_id: nombre de la columna con ID de paciente.
         columna_mensaje: nombre de la columna con el mensaje de texto.
 
@@ -1145,7 +1337,7 @@ def leer_excel_citas_medicas(filepath: str, columna_id: str = None,
         mensaje_texto, y headers es list[str] con los encabezados.
     """
     import openpyxl
-    wb = openpyxl.load_workbook(filepath, read_only=True)
+    wb = openpyxl.load_workbook(filepath_or_stream, read_only=True)
     ws = wb.active
     rows = list(ws.iter_rows(values_only=True))
     wb.close()
@@ -1245,7 +1437,7 @@ def extraer_esquema_medico(mensaje: str) -> dict:
         dict con accion, especialidad, preferencia_horario.
     """
     t = mensaje.lower()
-    palabras = set(re.findall(r"[a-záéíóúüñ]+", t))
+    palabras = set(_RE_PALABRAS.findall(t))
 
     acciones = [
         ("reprogramar", ["reprogramar", "reagendar", "cambiar fecha",
@@ -1344,97 +1536,61 @@ def extraer_esquema_medico(mensaje: str) -> dict:
 # ═══════════════════════════════════════════
 
 _SEP = "\n|||SEP|||\n"
-_MAX_CHARS_LOTE = 4500
 
-_cache_traducciones = {}
-_cache_estadisticas = {"textos_originales": 0, "textos_unicos": 0, "peticiones_google": 0}
+_cache_estadisticas = {"textos_originales": 0, "textos_unicos": 0, "peticiones_traduccion": 0,
+                       "cache_hits": 0, "marian_textos": 0}
 
 
 def _limpiar_cache_traducciones():
-    """Reinicia metricas entre archivos (no borra la cache)."""
     _cache_estadisticas["textos_originales"] = 0
     _cache_estadisticas["textos_unicos"] = 0
-    _cache_estadisticas["peticiones_google"] = 0
+    _cache_estadisticas["peticiones_traduccion"] = 0
+    _cache_estadisticas["cache_hits"] = 0
+    _cache_estadisticas["marian_textos"] = 0
 
 
 def _obtener_metricas_cache() -> dict:
-    """Retorna metricas de la cache de traducciones."""
     return dict(_cache_estadisticas)
 
 
 def _traducir_lote(textos: list, idioma_origen: str) -> list:
-    """Traduce un lote de textos con deduplicacion para evitar trabajo repetido.
-
-    Si el mismo texto aparece varias veces, solo se traduce una vez.
-    El resultado se reconstruye en el orden original.
-    Usa cache en memoria + persistente en disco.
-    """
     if not textos:
         return []
 
     _cache_estadisticas["textos_originales"] += len(textos)
     destino = "en" if idioma_origen == "es" else "es"
 
-    # Deduplicar: traducir solo textos unicos
     unicos = []
     mapa = {}
     for i, t in enumerate(textos):
         if t not in mapa:
             mapa[t] = []
-        mapa[t].append(i)
-        if len(mapa[t]) == 1:
             unicos.append(t)
+        mapa[t].append(i)
 
     _cache_estadisticas["textos_unicos"] += len(unicos)
-    total_chars = sum(len(t) for t in unicos) + len(_SEP) * (len(unicos) - 1)
 
-    if total_chars > _MAX_CHARS_LOTE and len(unicos) > 1:
-        mitad = len(unicos) // 2
-        trad_izq = _traducir_lote(unicos[:mitad], idioma_origen)
-        trad_der = _traducir_lote(unicos[mitad:], idioma_origen)
-        traducciones_unicas = trad_izq + trad_der
-    elif len(unicos) == 1:
-        if unicos[0] in _cache_traducciones:
-            traducciones_unicas = [_cache_traducciones[unicos[0]]]
+    traducciones_unicas = [None] * len(unicos)
+    pendientes = []
+    indices_pendientes = []
+
+    for i, t in enumerate(unicos):
+        cached = _cache_get(t, idioma_origen, destino)
+        if cached is not None:
+            traducciones_unicas[i] = cached
+            _cache_estadisticas["cache_hits"] += 1
         else:
-            try:
-                _cache_estadisticas["peticiones_google"] += 1
-                trad = traducir(unicos[0], idioma_origen, destino)
-                _cache_traducciones[unicos[0]] = trad
-                traducciones_unicas = [trad]
-            except Exception:
-                traducciones_unicas = [""]
-    else:
-        pendientes = []
-        indices_pendientes = []
-        traducciones_unicas = [""] * len(unicos)
-        for i, t in enumerate(unicos):
-            if t in _cache_traducciones:
-                traducciones_unicas[i] = _cache_traducciones[t]
-            else:
-                pendientes.append(t)
-                indices_pendientes.append(i)
+            pendientes.append(t)
+            indices_pendientes.append(i)
 
-        if pendientes:
-            _cache_estadisticas["peticiones_google"] += 1
-            texto_concatenado = _SEP.join(pendientes)
-            try:
-                traduccion = traducir(texto_concatenado, idioma_origen, destino)
-                partes = traduccion.split(_SEP)
-                partes_limpias = [p.strip() for p in partes]
-                if len(partes_limpias) == len(pendientes):
-                    for j, idx in enumerate(indices_pendientes):
-                        traducciones_unicas[idx] = partes_limpias[j]
-                        _cache_traducciones[pendientes[j]] = partes_limpias[j]
-                else:
-                    for j, idx in enumerate(indices_pendientes):
-                        trad = _traducir_lote([pendientes[j]], idioma_origen)[0]
-                        traducciones_unicas[idx] = trad
-            except Exception:
-                for j, idx in enumerate(indices_pendientes):
-                    traducciones_unicas[idx] = ""
+    if pendientes:
+        _cache_estadisticas["peticiones_traduccion"] += 1
+        _cache_estadisticas["marian_textos"] += len(pendientes)
+        nuevas = _marian_translate(pendientes, idioma_origen, destino)
+        for j, idx in enumerate(indices_pendientes):
+            traducciones_unicas[idx] = nuevas[j]
+            _cache_set(pendientes[j], idioma_origen, destino, nuevas[j])
 
-    # Reconstruir resultado en orden original
     resultado = [""] * len(textos)
     for i, t in enumerate(unicos):
         for pos in mapa[t]:
@@ -1488,9 +1644,9 @@ def optimizar_texto(texto: str, idioma_destino: str) -> str:
         for patron, reemplazo in _FRASES_REDUNDANTES:
             t = re.sub(patron, reemplazo, t)
 
-    t = re.sub(r"\s{2,}", " ", t).strip()
-    t = re.sub(r"\s+\.", ".", t)
-    t = re.sub(r"\s+,", ",", t)
+    t = _RE_ESPACIOS.sub(" ", t).strip()
+    t = _RE_ESPACIO_PUNTO.sub(".", t)
+    t = _RE_ESPACIO_COMA.sub(",", t)
 
     if t and t[0].islower():
         t = t[0].upper() + t[1:]

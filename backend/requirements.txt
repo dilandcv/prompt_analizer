@@ -2,7 +2,10 @@ fastapi
 uvicorn[standard]
 python-multipart
 tiktoken
-deep-translator
+torch
+transformers
+sentencepiece
+sacremoses
 ollama
 openpyxl
 PyMuPDF
